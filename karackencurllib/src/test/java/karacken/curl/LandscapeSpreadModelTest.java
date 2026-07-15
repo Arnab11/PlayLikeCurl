@@ -51,6 +51,34 @@ public class LandscapeSpreadModelTest {
     }
 
     @Test
+    public void slowForwardReleaseAtTheBindingCommitsTheNextSpread() {
+        LandscapeSpreadModel model = new LandscapeSpreadModel(4, 0);
+        model.beginGesture(200f);
+        model.dragTo(100f, 100f);
+
+        Settlement settlement = model.release();
+
+        assertEquals(PageChange.NEXT, settlement.getPageChange());
+        model.completeSettlement(settlement);
+        assertEquals(2, model.getCurrentLeftPageIndex());
+        assertEquals(3, model.getCurrentRightPageIndex());
+    }
+
+    @Test
+    public void slowBackwardReleaseAtTheBindingCommitsThePreviousSpread() {
+        LandscapeSpreadModel model = new LandscapeSpreadModel(4, 2);
+        model.beginGesture(0f);
+        model.dragTo(100f, 100f);
+
+        Settlement settlement = model.release();
+
+        assertEquals(PageChange.PREVIOUS, settlement.getPageChange());
+        model.completeSettlement(settlement);
+        assertEquals(0, model.getCurrentLeftPageIndex());
+        assertEquals(1, model.getCurrentRightPageIndex());
+    }
+
+    @Test
     public void oddFinalPageDoesNotEscapeTheAdapter() {
         LandscapeSpreadModel model = new LandscapeSpreadModel(5, 4);
 

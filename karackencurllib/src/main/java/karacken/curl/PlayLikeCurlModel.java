@@ -15,6 +15,8 @@ public final class PlayLikeCurlModel {
     public static final float FRONT_DEPTH = -0.002f;
     public static final float RIGHT_DEPTH = -0.003f;
     public static final float RIGHT_ENDPOINT_POSITION = GRID * (RIGHT_ENDPOINT_PERCENT / 100f);
+    private static final float RELEASE_COMMIT_POSITION =
+            (GRID + RIGHT_ENDPOINT_POSITION) / 2f;
 
     private final int pageCount;
     private final PageState leftPage = new PageState(
@@ -100,14 +102,28 @@ public final class PlayLikeCurlModel {
     }
 
     Settlement release() {
-        if (activePage == ActivePage.CURRENT) {
+        if (activePage == ActivePage.LEFT) {
+            if (canSwipePrevious()
+                    && activePageState().getCurlPosition() >= RELEASE_COMMIT_POSITION) {
+                return settlement(
+                        LEFT_ENDPOINT_PERCENT,
+                        PageChange.PREVIOUS,
+                        SettlementInterpolator.DECELERATE);
+            }
             return settlement(
-                    LEFT_ENDPOINT_PERCENT,
+                    RIGHT_ENDPOINT_PERCENT,
                     PageChange.NONE,
                     SettlementInterpolator.ACCELERATE_DECELERATE);
         }
+        if (canSwipeNext()
+                && activePageState().getCurlPosition() <= RELEASE_COMMIT_POSITION) {
+            return settlement(
+                    RIGHT_ENDPOINT_PERCENT,
+                    PageChange.NEXT,
+                    SettlementInterpolator.DECELERATE);
+        }
         return settlement(
-                RIGHT_ENDPOINT_PERCENT,
+                LEFT_ENDPOINT_PERCENT,
                 PageChange.NONE,
                 SettlementInterpolator.ACCELERATE_DECELERATE);
     }

@@ -103,6 +103,48 @@ public class PlayLikeCurlReferenceModelTest {
     }
 
     @Test
+    public void slowForwardReleasePastMidpointCommitsTheNextPage() {
+        PlayLikeCurlModel model = new PlayLikeCurlModel(4, 0);
+        model.beginGesture(100f);
+        model.dragTo(25f, 100f);
+
+        Settlement settlement = model.release();
+
+        assertEquals(-5, settlement.getTargetPercent());
+        assertEquals(PageChange.NEXT, settlement.getPageChange());
+        model.completeSettlement(settlement);
+        assertEquals(1, model.getCurrentPosition());
+    }
+
+    @Test
+    public void slowBackwardReleasePastMidpointCommitsThePreviousPage() {
+        PlayLikeCurlModel model = new PlayLikeCurlModel(4, 2);
+        model.beginGesture(0f);
+        model.dragTo(75f, 100f);
+
+        Settlement settlement = model.release();
+
+        assertEquals(100, settlement.getTargetPercent());
+        assertEquals(PageChange.PREVIOUS, settlement.getPageChange());
+        model.completeSettlement(settlement);
+        assertEquals(1, model.getCurrentPosition());
+    }
+
+    @Test
+    public void slowReleaseBeforeMidpointStillRollsBack() {
+        PlayLikeCurlModel forward = new PlayLikeCurlModel(4, 0);
+        forward.beginGesture(100f);
+        forward.dragTo(75f, 100f);
+
+        PlayLikeCurlModel backward = new PlayLikeCurlModel(4, 2);
+        backward.beginGesture(0f);
+        backward.dragTo(25f, 100f);
+
+        assertEquals(PageChange.NONE, forward.release().getPageChange());
+        assertEquals(PageChange.NONE, backward.release().getPageChange());
+    }
+
+    @Test
     public void referenceGeometryPreservesAspectCorrectionAndRoleSpecificDeformation() {
         PageGeometry portrait = PlayLikeCurlGeometry.createPage(
                 PageRole.FRONT, 1000, 1500, PageOrientation.PORTRAIT);
