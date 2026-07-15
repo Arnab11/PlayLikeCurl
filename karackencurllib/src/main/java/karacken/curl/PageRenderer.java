@@ -38,6 +38,28 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
                     + "  gl_FragColor = texture2D(uTexture, vTextureCoordinate);\n"
                     + "}\n";
 
+    private static final String SHADOW_VERTEX_SHADER =
+            "uniform mat4 uMvpMatrix;\n"
+                    + "attribute vec3 aPosition;\n"
+                    + "attribute float aGradient;\n"
+                    + "varying float vGradient;\n"
+                    + "void main() {\n"
+                    + "  gl_Position = uMvpMatrix * vec4(aPosition, 1.0);\n"
+                    + "  vGradient = aGradient;\n"
+                    + "}\n";
+
+    private static final String SHADOW_FRAGMENT_SHADER =
+            "precision mediump float;\n"
+                    + "uniform float uOpacity;\n"
+                    + "varying float vGradient;\n"
+                    + "void main() {\n"
+                    + "  float falloff = 1.0 - smoothstep(0.0, 1.0, vGradient);\n"
+                    + "  gl_FragColor = vec4(0.0, 0.0, 0.0, uOpacity * falloff);\n"
+                    + "}\n";
+
+    private static final short[] SHADOW_INDICES = {0, 1, 2, 2, 1, 3};
+    private static final float SHADOW_DEPTH = PlayLikeCurlModel.RIGHT_DEPTH + 0.00025f;
+
     private final Context context;
     private final GpuMesh leftMesh = new GpuMesh(PageRole.LEFT);
     private final GpuMesh frontMesh = new GpuMesh(PageRole.FRONT);
@@ -57,6 +79,9 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
     private final float[] projectionMatrix = new float[16];
     private final float[] modelMatrix = new float[16];
     private final float[] mvpMatrix = new float[16];
+    private final FloatBuffer shadowPositionBuffer = directFloatBuffer(12);
+    private final FloatBuffer shadowGradientBuffer = directFloatBuffer(4);
+    private final ShortBuffer shadowIndexBuffer = directShortBuffer(SHADOW_INDICES.length);
 
     private PlayLikeCurlModel portraitModel;
     private LandscapeSpreadModel landscapeSpreadModel;
@@ -76,6 +101,11 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
     private int textureCoordinateAttribute;
     private int matrixUniform;
     private int textureUniform;
+    private int shadowProgram;
+    private int shadowPositionAttribute;
+    private int shadowGradientAttribute;
+    private int shadowMatrixUniform;
+    private int shadowOpacityUniform;
 
     public PageRenderer(Context context) {
         this.context = context.getApplicationContext();
@@ -128,6 +158,11 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
         textureCoordinateAttribute = GLES20.glGetAttribLocation(program, "aTextureCoordinate");
         matrixUniform = GLES20.glGetUniformLocation(program, "uMvpMatrix");
         textureUniform = GLES20.glGetUniformLocation(program, "uTexture");
+        shadowProgram = createProgram(SHADOW_VERTEX_SHADER, SHADOW_FRAGMENT_SHADER);
+        shadowPositionAttribute = GLES20.glGetAttribLocation(shadowProgram, "aPosition");
+        shadowGradientAttribute = GLES20.glGetAttribLocation(shadowProgram, "aGradient");
+        shadowMatrixUniform = GLES20.glGetUniformLocation(shadowProgram, "uMvpMatrix");
+        shadowOpacityUniform = GLES20.glGetUniformLocation(shadowProgram, "uOpacity");
 
         GLES20.glClearColor(0f, 0f, 0f, 1f);
         GLES20.glClearDepthf(1f);
@@ -166,23 +201,42 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
     private void drawPortraitPage() {
         GLES20.glViewport(0, 0, viewportWidth, viewportHeight);
         updateMvp(viewportWidth, viewportHeight);
+        if (portraitModel.getActivePage() == ActivePage.LEFT) {
+            drawPage(
+                    rightMesh,
+                    portraitRightResource,
+                    portraitModel.getRightPage(),
+                    false,
+                    PageOrientation.PORTRAIT);
+            drawPage(
+                    frontMesh,
+                    portraitFrontResource,
+                    portraitModel.getFrontPage(),
+                    false,
+                    PageOrientation.PORTRAIT);
+            drawMovingPage(
+                    leftMesh,
+                    portraitLeftResource,
+                    portraitModel.getLeftPage(),
+                    PageOrientation.PORTRAIT);
+            return;
+        }
         drawPage(
                 leftMesh,
                 portraitLeftResource,
                 portraitModel.getLeftPage(),
-                portraitModel.getActivePage() == ActivePage.LEFT,
-                PageOrientation.PORTRAIT);
-        drawPage(
-                frontMesh,
-                portraitFrontResource,
-                portraitModel.getFrontPage(),
-                portraitModel.getActivePage() == ActivePage.CURRENT,
+                false,
                 PageOrientation.PORTRAIT);
         drawPage(
                 rightMesh,
                 portraitRightResource,
                 portraitModel.getRightPage(),
-                portraitModel.getActivePage() == ActivePage.RIGHT,
+                false,
+                PageOrientation.PORTRAIT);
+        drawMovingPage(
+                frontMesh,
+                portraitFrontResource,
+                portraitModel.getFrontPage(),
                 PageOrientation.PORTRAIT);
     }
 
@@ -260,7 +314,81 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
             boolean active) {
         GLES20.glViewport(x, 0, width, viewportHeight);
         updateMvp(width, viewportHeight);
-        drawPage(mesh, resource, state, active, PageOrientation.PORTRAIT);
+        if (active) {
+            drawMovingPage(mesh, resource, state, PageOrientation.PORTRAIT);
+        } else {
+            drawPage(mesh, resource, state, false, PageOrientation.PORTRAIT);
+        }
+    }
+
+    private void drawMovingPage(
+            GpuMesh mesh,
+            String resource,
+            PageState state,
+            PageOrientation orientation) {
+        drawFoldShadow(mesh, resource, state, orientation);
+        drawPage(mesh, resource, state, true, orientation);
+    }
+
+    private void drawFoldShadow(
+            GpuMesh mesh,
+            String resource,
+            PageState state,
+            PageOrientation orientation) {
+        GpuTexture texture = ensureTexture(resource);
+        if (texture == null) return;
+        FoldShadowModel.State shadow = FoldShadowModel.resolve(
+                mesh.role, state.getCurlPosition(), mesh.horizontallyMirrored);
+        if (shadow.getOpacity() <= 0.001f) return;
+
+        float bitmapRatio = PlayLikeCurlGeometry.bitmapRatio(
+                texture.bitmapWidth, texture.bitmapHeight, orientation);
+        float heightCorrection = (bitmapRatio - 1f) / 2f;
+        float bottom = -heightCorrection;
+        float top = bitmapRatio - heightCorrection;
+        shadowPositionBuffer.clear();
+        shadowPositionBuffer.put(new float[] {
+                shadow.getStartX(), bottom, SHADOW_DEPTH,
+                shadow.getEndX(), bottom, SHADOW_DEPTH,
+                shadow.getStartX(), top, SHADOW_DEPTH,
+                shadow.getEndX(), top, SHADOW_DEPTH
+        }).position(0);
+        shadowGradientBuffer.clear();
+        shadowGradientBuffer.put(shadow.isDarkAtStart()
+                ? new float[] {0f, 1f, 0f, 1f}
+                : new float[] {1f, 0f, 1f, 0f}).position(0);
+        shadowIndexBuffer.clear();
+        shadowIndexBuffer.put(SHADOW_INDICES).position(0);
+
+        // The shadow uses client-side buffers. Clear the page mesh VBO bindings first;
+        // otherwise GLES interprets these Java buffers as offsets into the bound VBOs.
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0);
+        GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, 0);
+        GLES20.glUseProgram(shadowProgram);
+        GLES20.glUniformMatrix4fv(shadowMatrixUniform, 1, false, mvpMatrix, 0);
+        GLES20.glUniform1f(shadowOpacityUniform, shadow.getOpacity());
+        GLES20.glEnable(GLES20.GL_BLEND);
+        GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA);
+        GLES20.glDepthMask(false);
+        GLES20.glDisable(GLES20.GL_DEPTH_TEST);
+        GLES20.glEnableVertexAttribArray(shadowPositionAttribute);
+        GLES20.glVertexAttribPointer(
+                shadowPositionAttribute, 3, GLES20.GL_FLOAT, false, 0, shadowPositionBuffer);
+        GLES20.glEnableVertexAttribArray(shadowGradientAttribute);
+        GLES20.glVertexAttribPointer(
+                shadowGradientAttribute, 1, GLES20.GL_FLOAT, false, 0, shadowGradientBuffer);
+        GLES20.glDrawElements(
+                GLES20.GL_TRIANGLES,
+                SHADOW_INDICES.length,
+                GLES20.GL_UNSIGNED_SHORT,
+                shadowIndexBuffer);
+        GLES20.glDisableVertexAttribArray(shadowPositionAttribute);
+        GLES20.glDisableVertexAttribArray(shadowGradientAttribute);
+        GLES20.glEnable(GLES20.GL_DEPTH_TEST);
+        GLES20.glDepthMask(true);
+        GLES20.glDisable(GLES20.GL_BLEND);
+        GLES20.glUseProgram(program);
+        GLES20.glUniform1i(textureUniform, 0);
     }
 
     private void preloadSpreadWindow() {

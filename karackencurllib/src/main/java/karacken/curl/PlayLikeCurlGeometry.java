@@ -12,9 +12,7 @@ final class PlayLikeCurlGeometry {
         if (bitmapWidth <= 0 || bitmapHeight <= 0) {
             throw new IllegalArgumentException("Bitmap dimensions must be positive");
         }
-        float bitmapRatio = orientation == PageOrientation.PORTRAIT
-                ? bitmapHeight / (float) bitmapWidth
-                : bitmapWidth / (float) bitmapHeight;
+        float bitmapRatio = bitmapRatio(bitmapWidth, bitmapHeight, orientation);
         int vertexCount = (PlayLikeCurlModel.GRID + 1) * (PlayLikeCurlModel.GRID + 1);
         PageGeometry page = new PageGeometry(
                 role,
@@ -59,6 +57,25 @@ final class PlayLikeCurlGeometry {
             throw new IllegalArgumentException("Viewport dimensions must be positive");
         }
         return height > width ? width / (float) height : height / (float) width;
+    }
+
+    static float bitmapRatio(int width, int height, PageOrientation orientation) {
+        if (width <= 0 || height <= 0) {
+            throw new IllegalArgumentException("Bitmap dimensions must be positive");
+        }
+        return orientation == PageOrientation.PORTRAIT
+                ? height / (float) width
+                : width / (float) height;
+    }
+
+    static float foldEdgeX(PageRole role, float curlPosition) {
+        if (role == PageRole.FRONT) {
+            return frontX(PlayLikeCurlModel.GRID, curlPosition);
+        }
+        if (role == PageRole.LEFT) {
+            return leftX(PlayLikeCurlModel.GRID, curlPosition);
+        }
+        return 1f;
     }
 
     private static float frontX(int column, float curlPosition) {

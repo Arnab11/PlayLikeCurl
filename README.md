@@ -9,10 +9,11 @@ model, deformation equations, projection, draw order, gesture mapping, and
 renderer with OpenGL ES 2 shaders and vertex/index buffers.
 
 The modernization deliberately does not add cached ebook bitmaps, Foliate
-integration, shadows, or new curl geometry. Portrait keeps the original
-one-page PlayLikeCurl path. The standalone landscape sample adds only a spread
-adapter around that same deformation, using four portrait leaves to demonstrate
-a `1 | 2` to `3 | 4` transition.
+integration, or new curl geometry. It does add a GLES2 fold cast-shadow pass
+that follows the existing deformation edge without changing the page mesh.
+Portrait keeps the original one-page PlayLikeCurl path. The standalone
+landscape sample adds only a spread adapter around that same deformation, using
+four portrait leaves to demonstrate a `1 | 2` to `3 | 4` transition.
 
 In landscape, a forward gesture is intentionally limited to the outer edge and
 the center binding:
@@ -23,6 +24,8 @@ the center binding:
 
 Backward navigation applies the symmetric sequence. Each leaf is rendered in a
 half-width OpenGL viewport, so the deformation cannot cross the center split.
+Slow releases commit after crossing the midpoint and otherwise settle back to
+the current page; the original fling behavior remains unchanged.
 
 Build and test the standalone proof of concept with:
 
@@ -63,7 +66,7 @@ For detecting gestures the default GestureDetector class has been used.
 
 ToDo
 ====
-* Need to add shadow below the page when it will move.
+* Replace the standalone sample assets with a client-provided page cache.
 
 
 

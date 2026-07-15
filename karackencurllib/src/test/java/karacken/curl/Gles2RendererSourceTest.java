@@ -53,4 +53,38 @@ public class Gles2RendererSourceTest {
         assertTrue(source.contains("drawPortraitPage"));
         assertTrue(source.contains("GLES20.glViewport(0, 0, viewportWidth, viewportHeight)"));
     }
+
+    @Test
+    public void rendererDrawsASeparateBlendedFoldShadow() throws IOException {
+        String source = Files.readString(
+                Path.of("src/main/java/karacken/curl/PageRenderer.java"),
+                StandardCharsets.UTF_8);
+
+        assertTrue(source.contains("SHADOW_FRAGMENT_SHADER"));
+        assertTrue(source.contains("drawFoldShadow"));
+        assertTrue(source.contains("GLES20.glEnable(GLES20.GL_BLEND)"));
+        assertTrue(source.contains("GLES20.glBlendFunc("));
+        assertTrue(source.contains("GLES20.GL_SRC_ALPHA"));
+        assertTrue(source.contains("GLES20.GL_ONE_MINUS_SRC_ALPHA"));
+    }
+
+    @Test
+    public void clientBufferShadowPassUnbindsMeshBufferObjects() throws IOException {
+        String source = Files.readString(
+                Path.of("src/main/java/karacken/curl/PageRenderer.java"),
+                StandardCharsets.UTF_8);
+
+        int shadowPass = source.indexOf("private void drawFoldShadow");
+        int arrayBufferUnbind = source.indexOf(
+                "GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)", shadowPass);
+        int elementBufferUnbind = source.indexOf(
+                "GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, 0)", shadowPass);
+        int firstClientAttribute = source.indexOf("GLES20.glVertexAttribPointer(", shadowPass);
+        int clientIndexDraw = source.indexOf("GLES20.glDrawElements(", shadowPass);
+
+        assertTrue(arrayBufferUnbind > shadowPass);
+        assertTrue(elementBufferUnbind > shadowPass);
+        assertTrue(arrayBufferUnbind < firstClientAttribute);
+        assertTrue(elementBufferUnbind < clientIndexDraw);
+    }
 }
