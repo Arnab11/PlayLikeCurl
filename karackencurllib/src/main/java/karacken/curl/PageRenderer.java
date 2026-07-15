@@ -13,10 +13,12 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
 import java.nio.ShortBuffer;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import javax.microedition.khronos.egl.EGLConfig;
 import javax.microedition.khronos.opengles.GL10;
 
-/** GLES2 renderer for PlayLikeCurl's original three-page model and deformation. */
+/** GLES2 renderer for PlayLikeCurl's original deformation and a two-leaf spread adapter. */
 public final class PageRenderer implements GLSurfaceView.Renderer {
     private static final String VERTEX_SHADER =
             "uniform mat4 uMvpMatrix;\n"
@@ -37,15 +39,38 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
                     + "}\n";
 
     private final Context context;
-    private final GpuPage leftPage = new GpuPage(PageRole.LEFT);
-    private final GpuPage frontPage = new GpuPage(PageRole.FRONT);
-    private final GpuPage rightPage = new GpuPage(PageRole.RIGHT);
+    private final GpuMesh leftMesh = new GpuMesh(PageRole.LEFT);
+    private final GpuMesh frontMesh = new GpuMesh(PageRole.FRONT);
+    private final GpuMesh mirroredLeftMesh = new GpuMesh(PageRole.LEFT, true);
+    private final GpuMesh mirroredFrontMesh = new GpuMesh(PageRole.FRONT, true);
+    private final GpuMesh rightMesh = new GpuMesh(PageRole.RIGHT);
+    private final Map<String, GpuTexture> textureCache = new ConcurrentHashMap<>();
+    private final PageState flatState = new PageState(
+            PageRole.RIGHT, PlayLikeCurlModel.RIGHT_DEPTH, PlayLikeCurlModel.GRID, 0);
+    private final PageState turningState = new PageState(
+            PageRole.FRONT, PlayLikeCurlModel.FRONT_DEPTH, PlayLikeCurlModel.GRID, 0);
+    private final PageState incomingState = new PageState(
+            PageRole.LEFT,
+            PlayLikeCurlModel.LEFT_DEPTH,
+            PlayLikeCurlModel.RIGHT_ENDPOINT_POSITION,
+            0);
     private final float[] projectionMatrix = new float[16];
     private final float[] modelMatrix = new float[16];
     private final float[] mvpMatrix = new float[16];
 
-    private PlayLikeCurlModel model;
-    private PageOrientation orientation = PageOrientation.PORTRAIT;
+    private PlayLikeCurlModel portraitModel;
+    private LandscapeSpreadModel landscapeSpreadModel;
+    private String portraitLeftResource = "";
+    private String portraitFrontResource = "";
+    private String portraitRightResource = "";
+    private String spreadPreviousLeftResource = "";
+    private String spreadPreviousRightResource = "";
+    private String spreadCurrentLeftResource = "";
+    private String spreadCurrentRightResource = "";
+    private String spreadNextLeftResource = "";
+    private String spreadNextRightResource = "";
+    private int viewportWidth = 1;
+    private int viewportHeight = 1;
     private int program;
     private int positionAttribute;
     private int textureCoordinateAttribute;
@@ -57,13 +82,43 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
     }
 
     void setModel(PlayLikeCurlModel model) {
-        this.model = model;
+        portraitModel = model;
+        landscapeSpreadModel = null;
+    }
+
+    void setLandscapeSpreadModel(LandscapeSpreadModel model) {
+        landscapeSpreadModel = model;
+        portraitModel = null;
     }
 
     public void updatePageRes(String leftResource, String frontResource, String rightResource) {
-        leftPage.setAssetPath(leftResource);
-        frontPage.setAssetPath(frontResource);
-        rightPage.setAssetPath(rightResource);
+        portraitLeftResource = safePath(leftResource);
+        portraitFrontResource = safePath(frontResource);
+        portraitRightResource = safePath(rightResource);
+        registerTexture(portraitLeftResource);
+        registerTexture(portraitFrontResource);
+        registerTexture(portraitRightResource);
+    }
+
+    public void updateSpreadResources(
+            String previousLeftResource,
+            String previousRightResource,
+            String currentLeftResource,
+            String currentRightResource,
+            String nextLeftResource,
+            String nextRightResource) {
+        spreadPreviousLeftResource = safePath(previousLeftResource);
+        spreadPreviousRightResource = safePath(previousRightResource);
+        spreadCurrentLeftResource = safePath(currentLeftResource);
+        spreadCurrentRightResource = safePath(currentRightResource);
+        spreadNextLeftResource = safePath(nextLeftResource);
+        spreadNextRightResource = safePath(nextRightResource);
+        registerTexture(spreadPreviousLeftResource);
+        registerTexture(spreadPreviousRightResource);
+        registerTexture(spreadCurrentLeftResource);
+        registerTexture(spreadCurrentRightResource);
+        registerTexture(spreadNextLeftResource);
+        registerTexture(spreadNextRightResource);
     }
 
     @Override
@@ -74,100 +129,282 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
         matrixUniform = GLES20.glGetUniformLocation(program, "uMvpMatrix");
         textureUniform = GLES20.glGetUniformLocation(program, "uTexture");
 
-        GLES20.glClearColor(0f, 0f, 0f, 0.5f);
+        GLES20.glClearColor(0f, 0f, 0f, 1f);
         GLES20.glClearDepthf(1f);
         GLES20.glEnable(GLES20.GL_DEPTH_TEST);
         GLES20.glDepthFunc(GLES20.GL_LEQUAL);
 
-        leftPage.initializeGl();
-        frontPage.initializeGl();
-        rightPage.initializeGl();
+        leftMesh.initializeGl();
+        frontMesh.initializeGl();
+        mirroredLeftMesh.initializeGl();
+        mirroredFrontMesh.initializeGl();
+        rightMesh.initializeGl();
+        for (GpuTexture texture : textureCache.values()) texture.resetGl();
     }
 
     @Override
     public void onSurfaceChanged(GL10 ignored, int width, int height) {
-        int safeHeight = Math.max(height, 1);
-        int safeWidth = Math.max(width, 1);
-        GLES20.glViewport(0, 0, safeWidth, safeHeight);
-        orientation = safeHeight > safeWidth
-                ? PageOrientation.PORTRAIT
-                : PageOrientation.LANDSCAPE;
-        Matrix.perspectiveM(
-                projectionMatrix,
-                0,
-                45f,
-                PlayLikeCurlGeometry.projectionAspect(safeWidth, safeHeight),
-                0.1f,
-                100f);
-        Matrix.setIdentityM(modelMatrix, 0);
-        Matrix.translateM(modelMatrix, 0, 0f, 0f, -2f);
-        Matrix.translateM(modelMatrix, 0, -0.5f, -0.5f, 0f);
-        Matrix.multiplyMM(mvpMatrix, 0, projectionMatrix, 0, modelMatrix, 0);
-
-        leftPage.invalidateAsset();
-        frontPage.invalidateAsset();
-        rightPage.invalidateAsset();
+        viewportWidth = Math.max(width, 1);
+        viewportHeight = Math.max(height, 1);
+        GLES20.glViewport(0, 0, viewportWidth, viewportHeight);
     }
 
     @Override
     public void onDrawFrame(GL10 ignored) {
+        GLES20.glViewport(0, 0, viewportWidth, viewportHeight);
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT | GLES20.GL_DEPTH_BUFFER_BIT);
-        PlayLikeCurlModel currentModel = model;
-        if (currentModel == null) return;
-
         GLES20.glUseProgram(program);
-        GLES20.glUniformMatrix4fv(matrixUniform, 1, false, mvpMatrix, 0);
         GLES20.glUniform1i(textureUniform, 0);
 
-        drawPage(leftPage, currentModel.getLeftPage(), currentModel.getActivePage() == ActivePage.LEFT);
-        drawPage(frontPage, currentModel.getFrontPage(), currentModel.getActivePage() == ActivePage.CURRENT);
-        drawPage(rightPage, currentModel.getRightPage(), currentModel.getActivePage() == ActivePage.RIGHT);
+        if (landscapeSpreadModel != null && viewportWidth > viewportHeight) {
+            drawLandscapeSpread();
+        } else if (portraitModel != null) {
+            drawPortraitPage();
+        }
     }
 
-    private void drawPage(GpuPage page, PageState state, boolean active) {
-        if (!page.ensureAsset(orientation)) return;
-        PlayLikeCurlGeometry.update(page.geometry, state.getCurlPosition(), active);
-        page.uploadPositions();
+    private void drawPortraitPage() {
+        GLES20.glViewport(0, 0, viewportWidth, viewportHeight);
+        updateMvp(viewportWidth, viewportHeight);
+        drawPage(
+                leftMesh,
+                portraitLeftResource,
+                portraitModel.getLeftPage(),
+                portraitModel.getActivePage() == ActivePage.LEFT,
+                PageOrientation.PORTRAIT);
+        drawPage(
+                frontMesh,
+                portraitFrontResource,
+                portraitModel.getFrontPage(),
+                portraitModel.getActivePage() == ActivePage.CURRENT,
+                PageOrientation.PORTRAIT);
+        drawPage(
+                rightMesh,
+                portraitRightResource,
+                portraitModel.getRightPage(),
+                portraitModel.getActivePage() == ActivePage.RIGHT,
+                PageOrientation.PORTRAIT);
+    }
 
+    private void drawLandscapeSpread() {
+        preloadSpreadWindow();
+        int leftWidth = viewportWidth / 2;
+        int rightWidth = viewportWidth - leftWidth;
+        LandscapeSpreadTransition transition = landscapeSpreadModel.getTransition();
+
+        if (transition.getProgress() == 0f) {
+            drawFlatLeaf(0, leftWidth, spreadCurrentLeftResource);
+            drawFlatLeaf(leftWidth, rightWidth, spreadCurrentRightResource);
+            return;
+        }
+
+        if (transition.isForward()) {
+            drawFlatLeaf(0, leftWidth, spreadCurrentLeftResource);
+            drawFlatLeaf(leftWidth, rightWidth, spreadNextRightResource);
+            turningState.setCurlPosition(transition.getTurningCurlPosition());
+            incomingState.setCurlPosition(transition.getIncomingCurlPosition());
+            if (transition.isTurningCurrentLeafVisible()) {
+                drawLeaf(
+                        leftWidth,
+                        rightWidth,
+                        spreadCurrentRightResource,
+                        frontMesh,
+                        turningState,
+                        true);
+            }
+            if (transition.isIncomingReverseLeafVisible()) {
+                drawLeaf(
+                        0,
+                        leftWidth,
+                        spreadNextLeftResource,
+                        mirroredLeftMesh,
+                        incomingState,
+                        true);
+            }
+        } else {
+            drawFlatLeaf(0, leftWidth, spreadPreviousLeftResource);
+            drawFlatLeaf(leftWidth, rightWidth, spreadCurrentRightResource);
+            turningState.setCurlPosition(transition.getTurningCurlPosition());
+            incomingState.setCurlPosition(transition.getIncomingCurlPosition());
+            if (transition.isTurningCurrentLeafVisible()) {
+                drawLeaf(
+                        0,
+                        leftWidth,
+                        spreadCurrentLeftResource,
+                        mirroredFrontMesh,
+                        turningState,
+                        true);
+            }
+            if (transition.isIncomingReverseLeafVisible()) {
+                drawLeaf(
+                        leftWidth,
+                        rightWidth,
+                        spreadPreviousRightResource,
+                        leftMesh,
+                        incomingState,
+                        true);
+            }
+        }
+    }
+
+    private void drawFlatLeaf(int x, int width, String resource) {
+        drawLeaf(x, width, resource, rightMesh, flatState, false);
+    }
+
+    private void drawLeaf(
+            int x,
+            int width,
+            String resource,
+            GpuMesh mesh,
+            PageState state,
+            boolean active) {
+        GLES20.glViewport(x, 0, width, viewportHeight);
+        updateMvp(width, viewportHeight);
+        drawPage(mesh, resource, state, active, PageOrientation.PORTRAIT);
+    }
+
+    private void preloadSpreadWindow() {
+        ensureTexture(spreadPreviousLeftResource);
+        ensureTexture(spreadPreviousRightResource);
+        ensureTexture(spreadCurrentLeftResource);
+        ensureTexture(spreadCurrentRightResource);
+        ensureTexture(spreadNextLeftResource);
+        ensureTexture(spreadNextRightResource);
+    }
+
+    private void drawPage(
+            GpuMesh mesh,
+            String resource,
+            PageState state,
+            boolean active,
+            PageOrientation orientation) {
+        GpuTexture texture = ensureTexture(resource);
+        if (texture == null) return;
+        mesh.ensureGeometry(texture.bitmapWidth, texture.bitmapHeight, orientation);
+        PlayLikeCurlGeometry.update(mesh.geometry, state.getCurlPosition(), active);
+        mesh.applyHorizontalMirrorToPositions();
+        mesh.uploadPositions();
+
+        GLES20.glUniformMatrix4fv(matrixUniform, 1, false, mvpMatrix, 0);
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, page.textureId);
-        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, page.positionBufferId);
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texture.textureId);
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, mesh.positionBufferId);
         GLES20.glEnableVertexAttribArray(positionAttribute);
         GLES20.glVertexAttribPointer(positionAttribute, 3, GLES20.GL_FLOAT, false, 0, 0);
-        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, page.textureBufferId);
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, mesh.textureBufferId);
         GLES20.glEnableVertexAttribArray(textureCoordinateAttribute);
         GLES20.glVertexAttribPointer(textureCoordinateAttribute, 2, GLES20.GL_FLOAT, false, 0, 0);
-        GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, page.indexBufferId);
+        GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, mesh.indexBufferId);
         GLES20.glDrawElements(
                 GLES20.GL_TRIANGLES,
-                page.geometry.getIndices().length,
+                mesh.geometry.getIndices().length,
                 GLES20.GL_UNSIGNED_SHORT,
                 0);
         GLES20.glDisableVertexAttribArray(positionAttribute);
         GLES20.glDisableVertexAttribArray(textureCoordinateAttribute);
     }
 
-    private final class GpuPage {
+    private void updateMvp(int width, int height) {
+        Matrix.perspectiveM(
+                projectionMatrix,
+                0,
+                45f,
+                PlayLikeCurlGeometry.projectionAspect(width, height),
+                0.1f,
+                100f);
+        Matrix.setIdentityM(modelMatrix, 0);
+        Matrix.translateM(modelMatrix, 0, 0f, 0f, -2f);
+        Matrix.translateM(modelMatrix, 0, -0.5f, -0.5f, 0f);
+        Matrix.multiplyMM(mvpMatrix, 0, projectionMatrix, 0, modelMatrix, 0);
+    }
+
+    private void registerTexture(String resource) {
+        if (!resource.isEmpty()) textureCache.computeIfAbsent(resource, GpuTexture::new);
+    }
+
+    private GpuTexture ensureTexture(String resource) {
+        if (resource.isEmpty()) return null;
+        GpuTexture texture = textureCache.computeIfAbsent(resource, GpuTexture::new);
+        texture.ensureUploaded();
+        return texture;
+    }
+
+    private final class GpuTexture {
+        private final String assetPath;
+        private int textureId;
+        private int bitmapWidth;
+        private int bitmapHeight;
+        private boolean uploaded;
+
+        GpuTexture(String assetPath) {
+            this.assetPath = assetPath;
+        }
+
+        void resetGl() {
+            textureId = 0;
+            uploaded = false;
+        }
+
+        void ensureUploaded() {
+            if (uploaded) return;
+            Bitmap bitmap;
+            try (InputStream input = context.getAssets().open(assetPath)) {
+                bitmap = BitmapFactory.decodeStream(input);
+            } catch (IOException exception) {
+                throw new IllegalStateException(
+                        "Could not open PlayLikeCurl asset " + assetPath, exception);
+            }
+            if (bitmap == null) {
+                throw new IllegalStateException("Could not decode PlayLikeCurl asset " + assetPath);
+            }
+
+            if (textureId == 0) {
+                int[] ids = new int[1];
+                GLES20.glGenTextures(1, ids, 0);
+                textureId = ids[0];
+            }
+            bitmapWidth = bitmap.getWidth();
+            bitmapHeight = bitmap.getHeight();
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId);
+            GLES20.glTexParameteri(
+                    GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR);
+            GLES20.glTexParameteri(
+                    GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR);
+            GLES20.glTexParameteri(
+                    GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE);
+            GLES20.glTexParameteri(
+                    GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE);
+            GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bitmap, 0);
+            bitmap.recycle();
+            uploaded = true;
+        }
+    }
+
+    private final class GpuMesh {
         private final PageRole role;
+        private final boolean horizontallyMirrored;
         private final FloatBuffer positionBuffer;
         private final FloatBuffer textureBuffer;
         private final ShortBuffer indexBuffer;
         private final int[] bufferIds = new int[3];
-        private final int[] textureIds = new int[1];
-
         private PageGeometry geometry;
-        private volatile String assetPath = "";
-        private String uploadedAssetPath;
-        private PageOrientation uploadedOrientation;
+        private int geometryWidth = -1;
+        private int geometryHeight = -1;
+        private PageOrientation geometryOrientation;
         private int positionBufferId;
         private int textureBufferId;
         private int indexBufferId;
-        private int textureId;
 
-        GpuPage(PageRole role) {
+        GpuMesh(PageRole role) {
+            this(role, false);
+        }
+
+        GpuMesh(PageRole role, boolean horizontallyMirrored) {
             this.role = role;
+            this.horizontallyMirrored = horizontallyMirrored;
             geometry = PlayLikeCurlGeometry.createPage(
                     role, 1, 1, PageOrientation.PORTRAIT);
+            if (horizontallyMirrored) mirrorTextureCoordinates(geometry.getTextureCoordinates());
             positionBuffer = directFloatBuffer(geometry.getPositions().length);
             textureBuffer = directFloatBuffer(geometry.getTextureCoordinates().length);
             indexBuffer = directShortBuffer(geometry.getIndices().length);
@@ -178,8 +415,6 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
             positionBufferId = bufferIds[0];
             textureBufferId = bufferIds[1];
             indexBufferId = bufferIds[2];
-            GLES20.glGenTextures(1, textureIds, 0);
-            textureId = textureIds[0];
 
             textureBuffer.clear();
             textureBuffer.put(geometry.getTextureCoordinates()).position(0);
@@ -205,51 +440,21 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
                     geometry.getPositions().length * Float.BYTES,
                     null,
                     GLES20.GL_DYNAMIC_DRAW);
-            invalidateAsset();
+            geometryWidth = -1;
+            geometryHeight = -1;
+            geometryOrientation = null;
         }
 
-        void setAssetPath(String assetPath) {
-            this.assetPath = assetPath == null ? "" : assetPath;
-        }
-
-        void invalidateAsset() {
-            uploadedAssetPath = null;
-            uploadedOrientation = null;
-        }
-
-        boolean ensureAsset(PageOrientation requestedOrientation) {
-            String requestedPath = assetPath;
-            if (requestedPath.isEmpty()) return false;
-            if (requestedPath.equals(uploadedAssetPath)
-                    && requestedOrientation == uploadedOrientation) {
-                return true;
+        void ensureGeometry(int width, int height, PageOrientation orientation) {
+            if (width == geometryWidth
+                    && height == geometryHeight
+                    && orientation == geometryOrientation) {
+                return;
             }
-
-            Bitmap bitmap;
-            try (InputStream input = context.getAssets().open(requestedPath)) {
-                bitmap = BitmapFactory.decodeStream(input);
-            } catch (IOException exception) {
-                throw new IllegalStateException("Could not open PlayLikeCurl asset " + requestedPath, exception);
-            }
-            if (bitmap == null) {
-                throw new IllegalStateException("Could not decode PlayLikeCurl asset " + requestedPath);
-            }
-
-            geometry = PlayLikeCurlGeometry.createPage(
-                    role,
-                    bitmap.getWidth(),
-                    bitmap.getHeight(),
-                    requestedOrientation);
-            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId);
-            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_NEAREST);
-            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR);
-            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_REPEAT);
-            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_REPEAT);
-            GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bitmap, 0);
-            bitmap.recycle();
-            uploadedAssetPath = requestedPath;
-            uploadedOrientation = requestedOrientation;
-            return true;
+            geometry = PlayLikeCurlGeometry.createPage(role, width, height, orientation);
+            geometryWidth = width;
+            geometryHeight = height;
+            geometryOrientation = orientation;
         }
 
         void uploadPositions() {
@@ -262,6 +467,24 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
                     geometry.getPositions().length * Float.BYTES,
                     positionBuffer);
         }
+
+        void applyHorizontalMirrorToPositions() {
+            if (!horizontallyMirrored) return;
+            float[] positions = geometry.getPositions();
+            for (int offset = 0; offset < positions.length; offset += 3) {
+                positions[offset] = 1f - positions[offset];
+            }
+        }
+    }
+
+    private static void mirrorTextureCoordinates(float[] coordinates) {
+        for (int offset = 0; offset < coordinates.length; offset += 2) {
+            coordinates[offset] = 1f - coordinates[offset];
+        }
+    }
+
+    private static String safePath(String path) {
+        return path == null ? "" : path;
     }
 
     private static int createProgram(String vertexSource, String fragmentSource) {

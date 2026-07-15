@@ -35,13 +35,20 @@ public class MainActivity extends AppCompatActivity {
         Display display = getWindowManager().getDefaultDisplay();
         Point size = new Point(); display.getSize(size);
          screen_width = size.x;  screen_height = size.y;
-       String[] res_array=null;
-        if(getResources().getConfiguration().orientation== Configuration.ORIENTATION_PORTRAIT)
-            res_array=  new String[]{"portrait/page1.png", "portrait/page2.png", "portrait/page3.png", "portrait/page4.png", "portrait/page5.png", "portrait/page6.png","portrait/page7.png","portrait/page8.png"};
-      else
-            res_array=  new String[]{"landscape/page1.png", "landscape/page2.png", "landscape/page3.png", "landscape/page4.png", "landscape/page5.png", "landscape/page6.png","landscape/page7.png","landscape/page8.png"};
+        boolean landscapeSpread = getResources().getConfiguration().orientation
+                == Configuration.ORIENTATION_LANDSCAPE;
+        String[] res_array = new String[]{
+                "portrait/page1.png",
+                "portrait/page2.png",
+                "portrait/page3.png",
+                "portrait/page4.png",
+                "portrait/page5.png",
+                "portrait/page6.png",
+                "portrait/page7.png",
+                "portrait/page8.png"};
 
         PageCurlAdapter pageCurlAdapter=new PageCurlAdapter(res_array);
+        pageSurfaceView.setLandscapeSpreadEnabled(landscapeSpread);
         pageSurfaceView.setPageCurlAdapter(pageCurlAdapter);
 
 

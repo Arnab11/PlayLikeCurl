@@ -37,4 +37,20 @@ public class Gles2RendererSourceTest {
         assertTrue(contextRequest >= 0);
         assertTrue(rendererInstall > contextRequest);
     }
+
+    @Test
+    public void landscapeUsesTwoLeafViewportsWithoutChangingPortraitComposition() throws IOException {
+        String source = Files.readString(
+                Path.of("src/main/java/karacken/curl/PageRenderer.java"),
+                StandardCharsets.UTF_8);
+
+        assertTrue(source.contains("drawLandscapeSpread"));
+        assertTrue(source.contains("viewportWidth / 2"));
+        assertTrue(source.contains("LandscapeSpreadTransition"));
+        assertTrue(source.contains("spreadNextLeftResource"));
+        assertTrue(source.contains("mirroredLeftMesh"));
+        assertTrue(source.contains("mirroredFrontMesh"));
+        assertTrue(source.contains("drawPortraitPage"));
+        assertTrue(source.contains("GLES20.glViewport(0, 0, viewportWidth, viewportHeight)"));
+    }
 }

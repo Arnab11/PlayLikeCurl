@@ -21,6 +21,8 @@ public class PageSurfaceView extends GLSurfaceView {
     private final GestureDetector gestureDetector;
     private PageCurlAdapter pageCurlAdapter;
     private PlayLikeCurlModel model;
+    private LandscapeSpreadModel landscapeSpreadModel;
+    private boolean landscapeSpreadEnabled;
     private ValueAnimator settlementAnimator;
     private boolean settlementRunning;
     private OnPageChangeListener onPageChangeListener;
@@ -40,15 +42,16 @@ public class PageSurfaceView extends GLSurfaceView {
                     MotionEvent moveEvent,
                     float velocityX,
                     float velocityY) {
-                if (model == null || downEvent == null) return false;
+                PlayLikeCurlModel interaction = interactionModelOrNull();
+                if (interaction == null || downEvent == null) return false;
                 if (Math.abs(downEvent.getY() - moveEvent.getY()) > SWIPE_MAX_OFF_PATH) return false;
                 if (Math.abs(velocityX) < SWIPE_THRESHOLD_VELOCITY) return false;
                 if (downEvent.getX() - moveEvent.getX() > SWIPE_MIN_DISTANCE) {
-                    settle(model.flingTowardNext());
+                    settle(interaction.flingTowardNext());
                     return true;
                 }
                 if (moveEvent.getX() - downEvent.getX() > SWIPE_MIN_DISTANCE) {
-                    settle(model.flingTowardPrevious());
+                    settle(interaction.flingTowardPrevious());
                     return true;
                 }
                 return false;
@@ -66,22 +69,30 @@ public class PageSurfaceView extends GLSurfaceView {
 
     @Override
     public boolean onTouchEvent(MotionEvent event) {
-        if (model == null) return true;
+        PlayLikeCurlModel interaction = interactionModelOrNull();
+        if (interaction == null) return true;
         if (settlementRunning) return true;
         boolean detectorHandled = gestureDetector.onTouchEvent(event);
+        float gestureWidth = landscapeSpreadModel != null
+                ? Math.max(1f, getWidth() / 2f)
+                : Math.max(1f, getWidth());
         switch (event.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
-                model.beginGesture(event.getX());
+                interaction.beginGesture(event.getX());
                 break;
             case MotionEvent.ACTION_MOVE:
-                model.dragTo(event.getX(), getWidth());
+                if (landscapeSpreadModel != null) {
+                    landscapeSpreadModel.dragTo(event.getX(), gestureWidth);
+                } else {
+                    interaction.dragTo(event.getX(), gestureWidth);
+                }
                 break;
             case MotionEvent.ACTION_UP:
-                if (!detectorHandled) settle(model.release());
+                if (!detectorHandled) settle(interaction.release());
                 performClick();
                 break;
             case MotionEvent.ACTION_CANCEL:
-                model.cancelGesture();
+                interaction.cancelGesture();
                 break;
             default:
                 break;
@@ -103,25 +114,35 @@ public class PageSurfaceView extends GLSurfaceView {
         return pageCurlAdapter;
     }
 
+    public void setLandscapeSpreadEnabled(boolean enabled) {
+        if (landscapeSpreadEnabled == enabled) return;
+        landscapeSpreadEnabled = enabled;
+        if (pageCurlAdapter != null) installModel(0);
+    }
+
     public void setPageCurlAdapter(PageCurlAdapter pageCurlAdapter) {
         if (pageCurlAdapter == null || pageCurlAdapter.getCount() == 0) {
             throw new IllegalArgumentException("PlayLikeCurl requires at least one page");
         }
         this.pageCurlAdapter = pageCurlAdapter;
-        model = new PlayLikeCurlModel(pageCurlAdapter.getCount(), 0);
-        renderer.setModel(model);
-        processPage();
+        installModel(0);
     }
 
     public void setCurrentPosition(int position) {
         requireModel();
-        model.jumpTo(position);
+        if (landscapeSpreadModel != null) {
+            landscapeSpreadModel.jumpTo(position);
+        } else {
+            model.jumpTo(position);
+        }
         processPage();
     }
 
     public int getCurrentPosition() {
         requireModel();
-        return model.getCurrentPosition();
+        return landscapeSpreadModel != null
+                ? landscapeSpreadModel.getCurrentPageIndex()
+                : model.getCurrentPosition();
     }
 
     public OnPageChangeListener getOnPageChangeListener() {
@@ -143,8 +164,14 @@ public class PageSurfaceView extends GLSurfaceView {
         settlementAnimator = ValueAnimator.ofFloat(startPercent, settlement.getTargetPercent());
         settlementAnimator.setDuration(settlement.getDurationMillis());
         settlementAnimator.setInterpolator(toAndroidInterpolator(settlement.getInterpolator()));
-        settlementAnimator.addUpdateListener(animation ->
-                model.updateSettlement((float) animation.getAnimatedValue()));
+        settlementAnimator.addUpdateListener(animation -> {
+            float value = (float) animation.getAnimatedValue();
+            if (landscapeSpreadModel != null) {
+                landscapeSpreadModel.updateSettlement(value);
+            } else {
+                model.updateSettlement(value);
+            }
+        });
         settlementAnimator.addListener(new AnimatorListenerAdapter() {
             private boolean cancelled;
 
@@ -163,31 +190,46 @@ public class PageSurfaceView extends GLSurfaceView {
     }
 
     private void completeSettlement(Settlement settlement) {
-        int previousPosition = model.getCurrentPosition();
-        model.completeSettlement(settlement);
-        if (model.getCurrentPosition() != previousPosition) {
+        int previousPosition = getCurrentPosition();
+        if (landscapeSpreadModel != null) {
+            landscapeSpreadModel.completeSettlement(settlement);
+        } else {
+            model.completeSettlement(settlement);
+        }
+        if (getCurrentPosition() != previousPosition) {
             processPage();
             if (onPageChangeListener != null) {
-                onPageChangeListener.onPageChanged(model.getCurrentPosition());
+                onPageChangeListener.onPageChanged(getCurrentPosition());
             }
         }
     }
 
     private float currentPagePercent() {
+        PlayLikeCurlModel interactionModel = interactionModel();
         PageState activeState;
-        if (model.getActivePage() == ActivePage.LEFT) {
-            activeState = model.getLeftPage();
-        } else if (model.getActivePage() == ActivePage.RIGHT) {
-            activeState = model.getRightPage();
+        if (interactionModel.getActivePage() == ActivePage.LEFT) {
+            activeState = interactionModel.getLeftPage();
+        } else if (interactionModel.getActivePage() == ActivePage.RIGHT) {
+            activeState = interactionModel.getRightPage();
         } else {
-            activeState = model.getFrontPage();
+            activeState = interactionModel.getFrontPage();
         }
         return activeState.getCurlPosition() / PlayLikeCurlModel.GRID * 100f;
     }
 
     private void processPage() {
-        int position = model.getCurrentPosition();
         int last = pageCurlAdapter.getCount() - 1;
+        if (landscapeSpreadModel != null) {
+            renderer.updateSpreadResources(
+                    pageCurlAdapter.getItemResource(landscapeSpreadModel.getPreviousLeftPageIndex()),
+                    pageCurlAdapter.getItemResource(landscapeSpreadModel.getPreviousRightPageIndex()),
+                    pageCurlAdapter.getItemResource(landscapeSpreadModel.getCurrentLeftPageIndex()),
+                    pageCurlAdapter.getItemResource(landscapeSpreadModel.getCurrentRightPageIndex()),
+                    pageCurlAdapter.getItemResource(landscapeSpreadModel.getNextLeftPageIndex()),
+                    pageCurlAdapter.getItemResource(landscapeSpreadModel.getNextRightPageIndex()));
+            return;
+        }
+        int position = model.getCurrentPosition();
         renderer.updatePageRes(
                 pageCurlAdapter.getItemResource(Math.max(0, position - 1)),
                 pageCurlAdapter.getItemResource(position),
@@ -195,7 +237,30 @@ public class PageSurfaceView extends GLSurfaceView {
     }
 
     private void requireModel() {
-        if (model == null) throw new IllegalStateException("Set a PageCurlAdapter first");
+        if (model == null && landscapeSpreadModel == null) {
+            throw new IllegalStateException("Set a PageCurlAdapter first");
+        }
+    }
+
+    private void installModel(int position) {
+        if (landscapeSpreadEnabled) {
+            landscapeSpreadModel = new LandscapeSpreadModel(pageCurlAdapter.getCount(), position);
+            model = null;
+            renderer.setLandscapeSpreadModel(landscapeSpreadModel);
+        } else {
+            model = new PlayLikeCurlModel(pageCurlAdapter.getCount(), position);
+            landscapeSpreadModel = null;
+            renderer.setModel(model);
+        }
+        processPage();
+    }
+
+    private PlayLikeCurlModel interactionModel() {
+        return landscapeSpreadModel != null ? landscapeSpreadModel.getMotionModel() : model;
+    }
+
+    private PlayLikeCurlModel interactionModelOrNull() {
+        return landscapeSpreadModel != null ? landscapeSpreadModel.getMotionModel() : model;
     }
 
     private static Interpolator toAndroidInterpolator(SettlementInterpolator interpolator) {
