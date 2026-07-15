@@ -1,5 +1,28 @@
 ![demo](demo.gif)
 
+GLES2 modernization proof of concept
+=====================================
+
+The `modernize/gles2-poc` branch preserves PlayLikeCurl's original three-page
+model, deformation equations, projection, draw order, gesture mapping, and
+300 ms settlement behavior while replacing the OpenGL ES 1 fixed-function
+renderer with OpenGL ES 2 shaders and vertex/index buffers.
+
+The modernization deliberately does not add reader-specific page boundaries,
+cached ebook bitmaps, Foliate integration, shadows, or new curl geometry. The
+original portrait and landscape demo assets remain the visual parity contract.
+
+Build and test the standalone proof of concept with:
+
+```powershell
+.\gradlew.bat :karackencurllib:testDebugUnitTest :app:assembleDebug
+```
+
+The reference model and source guards verify the locked page roles, geometry,
+endpoints, texture order, and GLES2 boundary. Runtime verification additionally
+covers forward, backward, cancelled, and full eight-page round-trip gestures in
+portrait and landscape.
+
 ## Notice :warning:
 This repo is no longer maintained
 
