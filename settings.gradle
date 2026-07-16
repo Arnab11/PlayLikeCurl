@@ -15,4 +15,4 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = 'PlayLikeCurl'
-include ':app', ':karackencurllib'
+include ':app', ':consumer-smoke', ':karackencurllib'

@@ -1,6 +1,6 @@
 package karacken.curl;
 
-enum PageChange {
+public enum PageChange {
     NONE,
     PREVIOUS,
     NEXT

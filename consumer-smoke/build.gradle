@@ -1,0 +1,16 @@
+plugins {
+    id 'com.android.library'
+}
+
+android {
+    namespace 'karacken.curl.consumer'
+    compileSdk 37
+
+    defaultConfig {
+        minSdk 24
+    }
+}
+
+dependencies {
+    implementation project(':karackencurllib')
+}

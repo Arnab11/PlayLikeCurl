@@ -1,25 +1,34 @@
 package karacken.curl;
 
-import android.content.Context;
 import android.graphics.Bitmap;
-import android.graphics.BitmapFactory;
 import android.opengl.GLES20;
 import android.opengl.GLSurfaceView;
 import android.opengl.GLUtils;
 import android.opengl.Matrix;
-import java.io.IOException;
-import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
 import java.nio.ShortBuffer;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.Set;
 import javax.microedition.khronos.egl.EGLConfig;
 import javax.microedition.khronos.opengles.GL10;
 
-/** GLES2 renderer for PlayLikeCurl's original deformation and a two-leaf spread adapter. */
+/** GLES2 renderer for client-prepared page bitmaps and PlayLikeCurl deformation. */
 public final class PageRenderer implements GLSurfaceView.Renderer {
+    interface Events {
+        void onCapabilitiesAvailable(RenderCapabilities capabilities);
+
+        void onDeckPrepared(long generationId);
+
+        void onDeckReleased(long generationId, DeckReleaseReason reason);
+
+        void onRenderFailure(RenderFailure failure);
+    }
+
     private static final String VERTEX_SHADER =
             "uniform mat4 uMvpMatrix;\n"
                     + "attribute vec3 aPosition;\n"
@@ -33,9 +42,13 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
     private static final String FRAGMENT_SHADER =
             "precision mediump float;\n"
                     + "uniform sampler2D uTexture;\n"
+                    + "uniform sampler2D uOverlayTexture;\n"
+                    + "uniform float uHasOverlay;\n"
                     + "varying vec2 vTextureCoordinate;\n"
                     + "void main() {\n"
-                    + "  gl_FragColor = texture2D(uTexture, vTextureCoordinate);\n"
+                    + "  vec4 base = texture2D(uTexture, vTextureCoordinate);\n"
+                    + "  vec4 overlay = texture2D(uOverlayTexture, vTextureCoordinate);\n"
+                    + "  gl_FragColor = mix(base, overlay + base * (1.0 - overlay.a), uHasOverlay);\n"
                     + "}\n";
 
     private static final String SHADOW_VERTEX_SHADER =
@@ -59,14 +72,15 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
 
     private static final short[] SHADOW_INDICES = {0, 1, 2, 2, 1, 3};
     private static final float SHADOW_DEPTH = PlayLikeCurlModel.RIGHT_DEPTH + 0.00025f;
+    private static final long DEFAULT_GPU_BUDGET_BYTES = 128L * 1024L * 1024L;
 
-    private final Context context;
+    private final Events events;
     private final GpuMesh leftMesh = new GpuMesh(PageRole.LEFT);
     private final GpuMesh frontMesh = new GpuMesh(PageRole.FRONT);
     private final GpuMesh mirroredLeftMesh = new GpuMesh(PageRole.LEFT, true);
     private final GpuMesh mirroredFrontMesh = new GpuMesh(PageRole.FRONT, true);
     private final GpuMesh rightMesh = new GpuMesh(PageRole.RIGHT);
-    private final Map<String, GpuTexture> textureCache = new ConcurrentHashMap<>();
+    private final Map<String, GpuTexture> textureCache = new LinkedHashMap<>();
     private final PageState flatState = new PageState(
             PageRole.RIGHT, PlayLikeCurlModel.RIGHT_DEPTH, PlayLikeCurlModel.GRID, 0);
     private final PageState turningState = new PageState(
@@ -85,15 +99,17 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
 
     private PlayLikeCurlModel portraitModel;
     private LandscapeSpreadModel landscapeSpreadModel;
-    private String portraitLeftResource = "";
-    private String portraitFrontResource = "";
-    private String portraitRightResource = "";
-    private String spreadPreviousLeftResource = "";
-    private String spreadPreviousRightResource = "";
-    private String spreadCurrentLeftResource = "";
-    private String spreadCurrentRightResource = "";
-    private String spreadNextLeftResource = "";
-    private String spreadNextRightResource = "";
+    private PageDeck<Bitmap> activeDeck;
+    private PageDeck<Bitmap> replacementDeck;
+    private PageImage<Bitmap> portraitLeftResource;
+    private PageImage<Bitmap> portraitFrontResource;
+    private PageImage<Bitmap> portraitRightResource;
+    private PageImage<Bitmap> spreadPreviousLeftResource;
+    private PageImage<Bitmap> spreadPreviousRightResource;
+    private PageImage<Bitmap> spreadCurrentLeftResource;
+    private PageImage<Bitmap> spreadCurrentRightResource;
+    private PageImage<Bitmap> spreadNextLeftResource;
+    private PageImage<Bitmap> spreadNextRightResource;
     private int viewportWidth = 1;
     private int viewportHeight = 1;
     private int program;
@@ -101,100 +117,535 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
     private int textureCoordinateAttribute;
     private int matrixUniform;
     private int textureUniform;
+    private int overlayTextureUniform;
+    private int hasOverlayUniform;
     private int shadowProgram;
     private int shadowPositionAttribute;
     private int shadowGradientAttribute;
     private int shadowMatrixUniform;
     private int shadowOpacityUniform;
+    private int maxTextureSize;
+    private long gpuBudgetBytes = DEFAULT_GPU_BUDGET_BYTES;
+    private boolean glReady;
+    private boolean disposed;
 
-    public PageRenderer(Context context) {
-        this.context = context.getApplicationContext();
+    PageRenderer(Events events) {
+        this.events = events;
     }
 
-    void setModel(PlayLikeCurlModel model) {
-        portraitModel = model;
-        landscapeSpreadModel = null;
+    void prepareDeck(PageDeck<Bitmap> deck, boolean activateWhenPrepared) {
+        if (disposed) {
+            reportFailure(
+                    deck.getGenerationId(),
+                    false,
+                    RenderFailureReason.DISPOSED,
+                    "Renderer is disposed",
+                    null);
+            events.onDeckReleased(deck.getGenerationId(), DeckReleaseReason.FAILED);
+            return;
+        }
+        boolean retained = false;
+        try {
+            validateDeck(deck);
+            PageDeck<Bitmap> prospectiveActive =
+                    activateWhenPrepared ? deck : activeDeck;
+            PageDeck<Bitmap> prospectivePending =
+                    activateWhenPrepared ? null : deck;
+            TextureBudget.Result budget = TextureBudget.evaluate(
+                    prospectiveActive,
+                    prospectivePending,
+                    maxTextureSize,
+                    gpuBudgetBytes);
+            if (budget.getFailureReason() != null) {
+                reportBudgetFailure(deck.getGenerationId(), budget);
+                events.onDeckReleased(deck.getGenerationId(), DeckReleaseReason.FAILED);
+                return;
+            }
+            if (activateWhenPrepared) {
+                activeDeck = deck;
+                replacementDeck = null;
+                applyActiveDeck(deck);
+            } else {
+                replacementDeck = deck;
+            }
+            retained = true;
+            retainDeckTextures();
+            if (glReady) {
+                uploadDeck(deck);
+                events.onDeckPrepared(deck.getGenerationId());
+            }
+        } catch (RuntimeException exception) {
+            reportFailure(
+                    deck.getGenerationId(),
+                    true,
+                    RenderFailureReason.BITMAP,
+                    "Could not prepare page deck",
+                    exception);
+            if (retained) {
+                releaseDeck(deck.getGenerationId(), DeckReleaseReason.FAILED);
+            } else {
+                events.onDeckReleased(deck.getGenerationId(), DeckReleaseReason.FAILED);
+            }
+        }
     }
 
-    void setLandscapeSpreadModel(LandscapeSpreadModel model) {
-        landscapeSpreadModel = model;
-        portraitModel = null;
+    void setGpuBudgetBytes(long gpuBudgetBytes) {
+        if (gpuBudgetBytes <= 0) {
+            throw new IllegalArgumentException("gpuBudgetBytes must be positive");
+        }
+        this.gpuBudgetBytes = gpuBudgetBytes;
+        publishCapabilities();
     }
 
-    public void updatePageRes(String leftResource, String frontResource, String rightResource) {
-        portraitLeftResource = safePath(leftResource);
-        portraitFrontResource = safePath(frontResource);
-        portraitRightResource = safePath(rightResource);
-        registerTexture(portraitLeftResource);
-        registerTexture(portraitFrontResource);
-        registerTexture(portraitRightResource);
+    void activateDeck(long generationId) {
+        if (disposed) {
+            return;
+        }
+        if (replacementDeck != null && replacementDeck.getGenerationId() == generationId) {
+            PageDeck<Bitmap> releasedDeck = activeDeck;
+            activeDeck = replacementDeck;
+            replacementDeck = null;
+            applyActiveDeck(activeDeck);
+            retainDeckTextures();
+            if (releasedDeck != null
+                    && releasedDeck.getGenerationId() != activeDeck.getGenerationId()) {
+                events.onDeckReleased(
+                        releasedDeck.getGenerationId(),
+                        DeckReleaseReason.REPLACED);
+            }
+        }
     }
 
-    public void updateSpreadResources(
-            String previousLeftResource,
-            String previousRightResource,
-            String currentLeftResource,
-            String currentRightResource,
-            String nextLeftResource,
-            String nextRightResource) {
-        spreadPreviousLeftResource = safePath(previousLeftResource);
-        spreadPreviousRightResource = safePath(previousRightResource);
-        spreadCurrentLeftResource = safePath(currentLeftResource);
-        spreadCurrentRightResource = safePath(currentRightResource);
-        spreadNextLeftResource = safePath(nextLeftResource);
-        spreadNextRightResource = safePath(nextRightResource);
-        registerTexture(spreadPreviousLeftResource);
-        registerTexture(spreadPreviousRightResource);
-        registerTexture(spreadCurrentLeftResource);
-        registerTexture(spreadCurrentRightResource);
-        registerTexture(spreadNextLeftResource);
-        registerTexture(spreadNextRightResource);
+    PlayLikeCurlModel getPortraitModel() {
+        return portraitModel;
+    }
+
+    LandscapeSpreadModel getLandscapeSpreadModel() {
+        return landscapeSpreadModel;
+    }
+
+    void setViewport(int width, int height) {
+        viewportWidth = Math.max(width, 1);
+        viewportHeight = Math.max(height, 1);
+    }
+
+    void releaseDeck(long generationId, DeckReleaseReason reason) {
+        boolean released = false;
+        if (activeDeck != null && activeDeck.getGenerationId() == generationId) {
+            activeDeck = null;
+            clearActiveDeck();
+            released = true;
+        }
+        if (replacementDeck != null && replacementDeck.getGenerationId() == generationId) {
+            replacementDeck = null;
+            released = true;
+        }
+        retainDeckTextures();
+        if (released) {
+            events.onDeckReleased(generationId, reason);
+        }
+    }
+
+    void dispose() {
+        if (disposed) {
+            return;
+        }
+        Set<Long> releasedGenerations = new LinkedHashSet<>();
+        if (activeDeck != null) {
+            releasedGenerations.add(activeDeck.getGenerationId());
+        }
+        if (replacementDeck != null) {
+            releasedGenerations.add(replacementDeck.getGenerationId());
+        }
+        disposed = true;
+        activeDeck = null;
+        replacementDeck = null;
+        clearActiveDeck();
+        for (GpuTexture texture : textureCache.values()) {
+            texture.deleteGl();
+        }
+        textureCache.clear();
+        leftMesh.dispose();
+        frontMesh.dispose();
+        mirroredLeftMesh.dispose();
+        mirroredFrontMesh.dispose();
+        rightMesh.dispose();
+        if (program != 0) {
+            GLES20.glDeleteProgram(program);
+            program = 0;
+        }
+        if (shadowProgram != 0) {
+            GLES20.glDeleteProgram(shadowProgram);
+            shadowProgram = 0;
+        }
+        glReady = false;
+        for (long generationId : releasedGenerations) {
+            events.onDeckReleased(generationId, DeckReleaseReason.DISPOSED);
+        }
+    }
+
+    /**
+     * Drops every client bitmap reference after the GL thread has been paused.
+     *
+     * <p>This is the terminal fallback for a detached surface whose GL event queue can no longer
+     * be relied upon to execute {@link #dispose()}. The EGL context owns any remaining GPU object
+     * deletion when the terminal pause destroys that context.
+     */
+    void abandonClientState() {
+        if (disposed) {
+            return;
+        }
+        disposed = true;
+        activeDeck = null;
+        replacementDeck = null;
+        clearActiveDeck();
+        textureCache.clear();
+        glReady = false;
     }
 
     @Override
     public void onSurfaceCreated(GL10 ignored, EGLConfig config) {
-        program = createProgram(VERTEX_SHADER, FRAGMENT_SHADER);
-        positionAttribute = GLES20.glGetAttribLocation(program, "aPosition");
-        textureCoordinateAttribute = GLES20.glGetAttribLocation(program, "aTextureCoordinate");
-        matrixUniform = GLES20.glGetUniformLocation(program, "uMvpMatrix");
-        textureUniform = GLES20.glGetUniformLocation(program, "uTexture");
-        shadowProgram = createProgram(SHADOW_VERTEX_SHADER, SHADOW_FRAGMENT_SHADER);
-        shadowPositionAttribute = GLES20.glGetAttribLocation(shadowProgram, "aPosition");
-        shadowGradientAttribute = GLES20.glGetAttribLocation(shadowProgram, "aGradient");
-        shadowMatrixUniform = GLES20.glGetUniformLocation(shadowProgram, "uMvpMatrix");
-        shadowOpacityUniform = GLES20.glGetUniformLocation(shadowProgram, "uOpacity");
+        if (disposed) {
+            return;
+        }
+        try {
+            program = createProgram(VERTEX_SHADER, FRAGMENT_SHADER);
+            positionAttribute = GLES20.glGetAttribLocation(program, "aPosition");
+            textureCoordinateAttribute =
+                    GLES20.glGetAttribLocation(program, "aTextureCoordinate");
+            matrixUniform = GLES20.glGetUniformLocation(program, "uMvpMatrix");
+            textureUniform = GLES20.glGetUniformLocation(program, "uTexture");
+            overlayTextureUniform =
+                    GLES20.glGetUniformLocation(program, "uOverlayTexture");
+            hasOverlayUniform = GLES20.glGetUniformLocation(program, "uHasOverlay");
+            shadowProgram = createProgram(SHADOW_VERTEX_SHADER, SHADOW_FRAGMENT_SHADER);
+            shadowPositionAttribute =
+                    GLES20.glGetAttribLocation(shadowProgram, "aPosition");
+            shadowGradientAttribute =
+                    GLES20.glGetAttribLocation(shadowProgram, "aGradient");
+            shadowMatrixUniform =
+                    GLES20.glGetUniformLocation(shadowProgram, "uMvpMatrix");
+            shadowOpacityUniform =
+                    GLES20.glGetUniformLocation(shadowProgram, "uOpacity");
 
-        GLES20.glClearColor(0f, 0f, 0f, 1f);
-        GLES20.glClearDepthf(1f);
-        GLES20.glEnable(GLES20.GL_DEPTH_TEST);
-        GLES20.glDepthFunc(GLES20.GL_LEQUAL);
+            GLES20.glClearColor(0f, 0f, 0f, 1f);
+            GLES20.glClearDepthf(1f);
+            GLES20.glEnable(GLES20.GL_DEPTH_TEST);
+            GLES20.glDepthFunc(GLES20.GL_LEQUAL);
+            int[] textureLimits = new int[1];
+            GLES20.glGetIntegerv(GLES20.GL_MAX_TEXTURE_SIZE, textureLimits, 0);
+            if (textureLimits[0] <= 0) {
+                throw new IllegalStateException(
+                        "GL_MAX_TEXTURE_SIZE was not reported");
+            }
+            maxTextureSize = textureLimits[0];
 
-        leftMesh.initializeGl();
-        frontMesh.initializeGl();
-        mirroredLeftMesh.initializeGl();
-        mirroredFrontMesh.initializeGl();
-        rightMesh.initializeGl();
-        for (GpuTexture texture : textureCache.values()) texture.resetGl();
+            leftMesh.initializeGl();
+            frontMesh.initializeGl();
+            mirroredLeftMesh.initializeGl();
+            mirroredFrontMesh.initializeGl();
+            rightMesh.initializeGl();
+            for (GpuTexture texture : textureCache.values()) {
+                texture.resetGl();
+            }
+            glReady = true;
+            publishCapabilities();
+            rehydrateRetainedDecks();
+        } catch (RuntimeException exception) {
+            glReady = false;
+            reportFailure(
+                    activeGeneration(),
+                    false,
+                    RenderFailureReason.SHADER,
+                    "Could not initialize PlayLikeCurl GLES2 renderer",
+                    exception);
+        }
     }
 
     @Override
     public void onSurfaceChanged(GL10 ignored, int width, int height) {
-        viewportWidth = Math.max(width, 1);
-        viewportHeight = Math.max(height, 1);
+        setViewport(width, height);
         GLES20.glViewport(0, 0, viewportWidth, viewportHeight);
     }
 
     @Override
     public void onDrawFrame(GL10 ignored) {
-        GLES20.glViewport(0, 0, viewportWidth, viewportHeight);
-        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT | GLES20.GL_DEPTH_BUFFER_BIT);
-        GLES20.glUseProgram(program);
-        GLES20.glUniform1i(textureUniform, 0);
+        if (disposed || !glReady || activeDeck == null) {
+            return;
+        }
+        try {
+            GLES20.glViewport(0, 0, viewportWidth, viewportHeight);
+            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT | GLES20.GL_DEPTH_BUFFER_BIT);
+            GLES20.glUseProgram(program);
+            GLES20.glUniform1i(textureUniform, 0);
+            GLES20.glUniform1i(overlayTextureUniform, 1);
 
-        if (landscapeSpreadModel != null && viewportWidth > viewportHeight) {
-            drawLandscapeSpread();
-        } else if (portraitModel != null) {
-            drawPortraitPage();
+            if (landscapeSpreadModel != null && viewportWidth > viewportHeight) {
+                drawLandscapeSpread();
+            } else if (portraitModel != null) {
+                drawPortraitPage();
+            }
+        } catch (RuntimeException exception) {
+            reportFailure(
+                    activeGeneration(),
+                    true,
+                    RenderFailureReason.CONTEXT,
+                    "Could not render page frame",
+                    exception);
+        }
+    }
+
+    private void applyActiveDeck(PageDeck<Bitmap> deck) {
+        if (deck instanceof PortraitPageDeck) {
+            PortraitPageDeck<Bitmap> portrait = (PortraitPageDeck<Bitmap>) deck;
+            portraitLeftResource = portrait.getPrevious();
+            portraitFrontResource = portrait.getCurrent();
+            portraitRightResource = portrait.getNext();
+            portraitModel = new PlayLikeCurlModel(3, 1);
+            landscapeSpreadModel = null;
+            clearSpreadResources();
+        } else if (deck instanceof LandscapePageDeck) {
+            LandscapePageDeck<Bitmap> spread = (LandscapePageDeck<Bitmap>) deck;
+            spreadPreviousLeftResource = spread.getPreviousLeft();
+            spreadPreviousRightResource = spread.getPreviousRight();
+            spreadCurrentLeftResource = spread.getCurrentLeft();
+            spreadCurrentRightResource = spread.getCurrentRight();
+            spreadNextLeftResource = spread.getNextLeft();
+            spreadNextRightResource = spread.getNextRight();
+            landscapeSpreadModel = new LandscapeSpreadModel(6, 2);
+            portraitModel = null;
+            clearPortraitResources();
+        } else {
+            throw new IllegalArgumentException("Unsupported page deck type");
+        }
+    }
+
+    private void clearActiveDeck() {
+        portraitModel = null;
+        landscapeSpreadModel = null;
+        clearPortraitResources();
+        clearSpreadResources();
+    }
+
+    private void clearPortraitResources() {
+        portraitLeftResource = null;
+        portraitFrontResource = null;
+        portraitRightResource = null;
+    }
+
+    private void clearSpreadResources() {
+        spreadPreviousLeftResource = null;
+        spreadPreviousRightResource = null;
+        spreadCurrentLeftResource = null;
+        spreadCurrentRightResource = null;
+        spreadNextLeftResource = null;
+        spreadNextRightResource = null;
+    }
+
+    private void validateDeck(PageDeck<Bitmap> deck) {
+        if (deck == null) {
+            throw new IllegalArgumentException("deck must not be null");
+        }
+        for (PageImage<Bitmap> page : deck.getPages()) {
+            Bitmap bitmap = page.getContent();
+            if (bitmap.isRecycled()) {
+                throw new IllegalArgumentException(
+                        "Bitmap is recycled for " + page.getLogicalPageId());
+            }
+            if (bitmap.getWidth() != page.getWidthPx()
+                    || bitmap.getHeight() != page.getHeightPx()) {
+                throw new IllegalArgumentException(
+                        "Bitmap dimensions differ from PageImage metadata for "
+                                + page.getLogicalPageId());
+            }
+            if (bitmap.getConfig() != Bitmap.Config.ARGB_8888) {
+                throw new IllegalArgumentException(
+                        "Bitmap must use ARGB_8888 for "
+                                + page.getLogicalPageId());
+            }
+            if (bitmap.hasAlpha()) {
+                throw new IllegalArgumentException(
+                        "Bitmap must be composited onto an opaque page background for "
+                                + page.getLogicalPageId());
+            }
+            Bitmap overlay = page.getOverlayContent();
+            if (overlay != null) {
+                if (overlay.isRecycled()) {
+                    throw new IllegalArgumentException(
+                            "Overlay bitmap is recycled for " + page.getLogicalPageId());
+                }
+                if (overlay.getWidth() != page.getWidthPx()
+                        || overlay.getHeight() != page.getHeightPx()) {
+                    throw new IllegalArgumentException(
+                            "Overlay dimensions differ from PageImage metadata for "
+                                    + page.getLogicalPageId());
+                }
+                if (overlay.getConfig() != Bitmap.Config.ARGB_8888) {
+                    throw new IllegalArgumentException(
+                            "Overlay bitmap must use ARGB_8888 for "
+                                    + page.getLogicalPageId());
+                }
+                if (!overlay.isPremultiplied() || !overlay.hasAlpha()) {
+                    throw new IllegalArgumentException(
+                            "Overlay bitmap must be premultiplied and retain alpha for "
+                                    + page.getLogicalPageId());
+                }
+            }
+        }
+    }
+
+    private void publishCapabilities() {
+        if (maxTextureSize > 0 && !disposed) {
+            events.onCapabilitiesAvailable(
+                    new RenderCapabilities(maxTextureSize, gpuBudgetBytes));
+        }
+    }
+
+    private void reportBudgetFailure(
+            long generationId,
+            TextureBudget.Result budget) {
+        RenderFailureReason reason = budget.getFailureReason();
+        String message;
+        if (reason == RenderFailureReason.TEXTURE_TOO_LARGE) {
+            message = "Page texture exceeds the device texture-size limit";
+        } else if (reason == RenderFailureReason.GPU_BUDGET_EXCEEDED) {
+            message = "Page decks exceed the configured GPU byte budget";
+        } else {
+            throw new IllegalArgumentException("Unsupported budget failure " + reason);
+        }
+        events.onRenderFailure(
+                new RenderFailure(
+                        generationId,
+                        true,
+                        reason,
+                        message,
+                        null,
+                        budget.getRequestedWidthPx(),
+                        budget.getRequestedHeightPx(),
+                        budget.getMaxTextureSize(),
+                        budget.getRequiredBytes(),
+                        budget.getGpuBudgetBytes()));
+    }
+
+    private void uploadDeck(PageDeck<Bitmap> deck) {
+        for (PageImage<Bitmap> page : deck.getPages()) {
+            GpuTexture texture = textureCache.get(page.identityKey());
+            if (texture == null) {
+                texture = new GpuTexture(page, false);
+                textureCache.put(page.identityKey(), texture);
+            }
+            texture.ensureUploaded();
+            if (page.hasOverlay()) {
+                GpuTexture overlay = textureCache.get(page.overlayIdentityKey());
+                if (overlay == null) {
+                    overlay = new GpuTexture(page, true);
+                    textureCache.put(page.overlayIdentityKey(), overlay);
+                }
+                overlay.ensureUploaded();
+            }
+        }
+    }
+
+    private void rehydrateRetainedDecks() {
+        PageDeck<Bitmap> retainedActive = activeDeck;
+        if (retainedActive != null) {
+            rehydrateDeck(retainedActive, retainedActive, null);
+        }
+        PageDeck<Bitmap> retainedReplacement = replacementDeck;
+        if (retainedReplacement != null) {
+            rehydrateDeck(
+                    retainedReplacement,
+                    activeDeck,
+                    retainedReplacement);
+        }
+    }
+
+    private boolean rehydrateDeck(
+            PageDeck<Bitmap> deck,
+            PageDeck<Bitmap> prospectiveActive,
+            PageDeck<Bitmap> prospectivePending) {
+        try {
+            validateDeck(deck);
+        } catch (RuntimeException exception) {
+            reportFailure(
+                    deck.getGenerationId(),
+                    true,
+                    RenderFailureReason.BITMAP,
+                    "Retained page bitmap is no longer valid",
+                    exception);
+            releaseDeck(deck.getGenerationId(), DeckReleaseReason.FAILED);
+            return false;
+        }
+
+        TextureBudget.Result budget = TextureBudget.evaluate(
+                prospectiveActive,
+                prospectivePending,
+                maxTextureSize,
+                gpuBudgetBytes);
+        if (budget.getFailureReason() != null) {
+            reportBudgetFailure(deck.getGenerationId(), budget);
+            releaseDeck(deck.getGenerationId(), DeckReleaseReason.FAILED);
+            return false;
+        }
+
+        try {
+            uploadDeck(deck);
+            events.onDeckPrepared(deck.getGenerationId());
+            return true;
+        } catch (RuntimeException exception) {
+            reportFailure(
+                    deck.getGenerationId(),
+                    true,
+                    RenderFailureReason.TEXTURE_UPLOAD,
+                    "Could not restore page textures after GL context recreation",
+                    exception);
+            releaseDeck(deck.getGenerationId(), DeckReleaseReason.FAILED);
+            return false;
+        }
+    }
+
+    private void retainDeckTextures() {
+        Set<String> retainedKeys = new LinkedHashSet<>();
+        collectDeckKeys(activeDeck, retainedKeys);
+        collectDeckKeys(replacementDeck, retainedKeys);
+        Iterator<Map.Entry<String, GpuTexture>> iterator =
+                textureCache.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<String, GpuTexture> entry = iterator.next();
+            if (!retainedKeys.contains(entry.getKey())) {
+                entry.getValue().deleteGl();
+                iterator.remove();
+            }
+        }
+        registerDeck(activeDeck);
+        registerDeck(replacementDeck);
+    }
+
+    private void registerDeck(PageDeck<Bitmap> deck) {
+        if (deck == null) {
+            return;
+        }
+        for (PageImage<Bitmap> page : deck.getPages()) {
+            textureCache.computeIfAbsent(
+                    page.identityKey(),
+                    key -> new GpuTexture(page, false));
+            if (page.hasOverlay()) {
+                textureCache.computeIfAbsent(
+                        page.overlayIdentityKey(),
+                        key -> new GpuTexture(page, true));
+            }
+        }
+    }
+
+    private static void collectDeckKeys(PageDeck<Bitmap> deck, Set<String> keys) {
+        if (deck == null) {
+            return;
+        }
+        for (PageImage<Bitmap> page : deck.getPages()) {
+            keys.add(page.identityKey());
+            if (page.hasOverlay()) {
+                keys.add(page.overlayIdentityKey());
+            }
         }
     }
 
@@ -301,14 +752,14 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
         }
     }
 
-    private void drawFlatLeaf(int x, int width, String resource) {
+    private void drawFlatLeaf(int x, int width, PageImage<Bitmap> resource) {
         drawLeaf(x, width, resource, rightMesh, flatState, false);
     }
 
     private void drawLeaf(
             int x,
             int width,
-            String resource,
+            PageImage<Bitmap> resource,
             GpuMesh mesh,
             PageState state,
             boolean active) {
@@ -323,7 +774,7 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
 
     private void drawMovingPage(
             GpuMesh mesh,
-            String resource,
+            PageImage<Bitmap> resource,
             PageState state,
             PageOrientation orientation) {
         drawFoldShadow(mesh, resource, state, orientation);
@@ -332,14 +783,18 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
 
     private void drawFoldShadow(
             GpuMesh mesh,
-            String resource,
+            PageImage<Bitmap> resource,
             PageState state,
             PageOrientation orientation) {
-        GpuTexture texture = ensureTexture(resource);
-        if (texture == null) return;
+        GpuTexture texture = texture(resource);
+        if (texture == null) {
+            return;
+        }
         FoldShadowModel.State shadow = FoldShadowModel.resolve(
                 mesh.role, state.getCurlPosition(), mesh.horizontallyMirrored);
-        if (shadow.getOpacity() <= 0.001f) return;
+        if (shadow.getOpacity() <= 0.001f) {
+            return;
+        }
 
         float bitmapRatio = PlayLikeCurlGeometry.bitmapRatio(
                 texture.bitmapWidth, texture.bitmapHeight, orientation);
@@ -360,8 +815,6 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
         shadowIndexBuffer.clear();
         shadowIndexBuffer.put(SHADOW_INDICES).position(0);
 
-        // The shadow uses client-side buffers. Clear the page mesh VBO bindings first;
-        // otherwise GLES interprets these Java buffers as offsets into the bound VBOs.
         GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0);
         GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, 0);
         GLES20.glUseProgram(shadowProgram);
@@ -389,39 +842,36 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
         GLES20.glDisable(GLES20.GL_BLEND);
         GLES20.glUseProgram(program);
         GLES20.glUniform1i(textureUniform, 0);
+        GLES20.glUniform1i(overlayTextureUniform, 1);
     }
 
     private void preloadSpreadWindow() {
-        ensureTexture(spreadPreviousLeftResource);
-        ensureTexture(spreadPreviousRightResource);
-        ensureTexture(spreadCurrentLeftResource);
-        ensureTexture(spreadCurrentRightResource);
-        ensureTexture(spreadNextLeftResource);
-        ensureTexture(spreadNextRightResource);
+        // Deck preparation uploads the complete six-leaf window before readiness is reported.
     }
 
     private void drawPage(
             GpuMesh mesh,
-            String resource,
+            PageImage<Bitmap> resource,
             PageState state,
             boolean active,
             PageOrientation orientation) {
-        GpuTexture texture = ensureTexture(resource);
-        if (texture == null) return;
+        GpuTexture texture = texture(resource);
+        if (texture == null) {
+            return;
+        }
         mesh.ensureGeometry(texture.bitmapWidth, texture.bitmapHeight, orientation);
         PlayLikeCurlGeometry.update(mesh.geometry, state.getCurlPosition(), active);
-        mesh.applyHorizontalMirrorToPositions();
         mesh.uploadPositions();
 
         GLES20.glUniformMatrix4fv(matrixUniform, 1, false, mvpMatrix, 0);
-        GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texture.textureId);
+        drawPageTextures(resource, texture);
         GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, mesh.positionBufferId);
         GLES20.glEnableVertexAttribArray(positionAttribute);
         GLES20.glVertexAttribPointer(positionAttribute, 3, GLES20.GL_FLOAT, false, 0, 0);
         GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, mesh.textureBufferId);
         GLES20.glEnableVertexAttribArray(textureCoordinateAttribute);
-        GLES20.glVertexAttribPointer(textureCoordinateAttribute, 2, GLES20.GL_FLOAT, false, 0, 0);
+        GLES20.glVertexAttribPointer(
+                textureCoordinateAttribute, 2, GLES20.GL_FLOAT, false, 0, 0);
         GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, mesh.indexBufferId);
         GLES20.glDrawElements(
                 GLES20.GL_TRIANGLES,
@@ -430,6 +880,36 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
                 0);
         GLES20.glDisableVertexAttribArray(positionAttribute);
         GLES20.glDisableVertexAttribArray(textureCoordinateAttribute);
+    }
+
+    private void drawPageTextures(
+            PageImage<Bitmap> resource,
+            GpuTexture baseTexture) {
+        GpuTexture overlayTexture = overlayTexture(resource);
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, baseTexture.textureId);
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE1);
+        GLES20.glBindTexture(
+                GLES20.GL_TEXTURE_2D,
+                overlayTexture == null ? 0 : overlayTexture.textureId);
+        GLES20.glUniform1f(hasOverlayUniform, overlayTexture == null ? 0f : 1f);
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
+    }
+
+    private GpuTexture texture(PageImage<Bitmap> page) {
+        if (page == null) {
+            return null;
+        }
+        GpuTexture texture = textureCache.get(page.identityKey());
+        return texture != null && texture.uploaded ? texture : null;
+    }
+
+    private GpuTexture overlayTexture(PageImage<Bitmap> page) {
+        if (page == null || !page.hasOverlay()) {
+            return null;
+        }
+        GpuTexture texture = textureCache.get(page.overlayIdentityKey());
+        return texture != null && texture.uploaded ? texture : null;
     }
 
     private void updateMvp(int width, int height) {
@@ -446,26 +926,31 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
         Matrix.multiplyMM(mvpMatrix, 0, projectionMatrix, 0, modelMatrix, 0);
     }
 
-    private void registerTexture(String resource) {
-        if (!resource.isEmpty()) textureCache.computeIfAbsent(resource, GpuTexture::new);
+    private long activeGeneration() {
+        return activeDeck == null ? -1L : activeDeck.getGenerationId();
     }
 
-    private GpuTexture ensureTexture(String resource) {
-        if (resource.isEmpty()) return null;
-        GpuTexture texture = textureCache.computeIfAbsent(resource, GpuTexture::new);
-        texture.ensureUploaded();
-        return texture;
+    private void reportFailure(
+            long generationId,
+            boolean recoverable,
+            RenderFailureReason reason,
+            String message,
+            Throwable cause) {
+        events.onRenderFailure(
+                new RenderFailure(generationId, recoverable, reason, message, cause));
     }
 
     private final class GpuTexture {
-        private final String assetPath;
+        private final PageImage<Bitmap> page;
+        private final boolean overlay;
         private int textureId;
         private int bitmapWidth;
         private int bitmapHeight;
         private boolean uploaded;
 
-        GpuTexture(String assetPath) {
-            this.assetPath = assetPath;
+        GpuTexture(PageImage<Bitmap> page, boolean overlay) {
+            this.page = page;
+            this.overlay = overlay;
         }
 
         void resetGl() {
@@ -474,23 +959,23 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
         }
 
         void ensureUploaded() {
-            if (uploaded) return;
-            Bitmap bitmap;
-            try (InputStream input = context.getAssets().open(assetPath)) {
-                bitmap = BitmapFactory.decodeStream(input);
-            } catch (IOException exception) {
-                throw new IllegalStateException(
-                        "Could not open PlayLikeCurl asset " + assetPath, exception);
+            if (uploaded) {
+                return;
             }
+            Bitmap bitmap = overlay ? page.getOverlayContent() : page.getContent();
             if (bitmap == null) {
-                throw new IllegalStateException("Could not decode PlayLikeCurl asset " + assetPath);
+                throw new IllegalStateException(
+                        "Overlay bitmap is missing for " + page.getLogicalPageId());
             }
-
-            if (textureId == 0) {
-                int[] ids = new int[1];
-                GLES20.glGenTextures(1, ids, 0);
-                textureId = ids[0];
+            if (bitmap.isRecycled()) {
+                throw new IllegalStateException(
+                        (overlay ? "Overlay bitmap" : "Bitmap")
+                                + " was recycled for "
+                                + page.getLogicalPageId());
             }
+            int[] ids = new int[1];
+            GLES20.glGenTextures(1, ids, 0);
+            textureId = ids[0];
             bitmapWidth = bitmap.getWidth();
             bitmapHeight = bitmap.getHeight();
             GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId);
@@ -503,8 +988,22 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
             GLES20.glTexParameteri(
                     GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE);
             GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bitmap, 0);
-            bitmap.recycle();
+            int error = GLES20.glGetError();
+            if (error != GLES20.GL_NO_ERROR) {
+                deleteGl();
+                throw new IllegalStateException(
+                        "Texture upload failed with GLES error " + error);
+            }
             uploaded = true;
+        }
+
+        void deleteGl() {
+            if (textureId != 0) {
+                int[] ids = {textureId};
+                GLES20.glDeleteTextures(1, ids, 0);
+            }
+            textureId = 0;
+            uploaded = false;
         }
     }
 
@@ -530,15 +1029,17 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
         GpuMesh(PageRole role, boolean horizontallyMirrored) {
             this.role = role;
             this.horizontallyMirrored = horizontallyMirrored;
-            geometry = PlayLikeCurlGeometry.createPage(
-                    role, 1, 1, PageOrientation.PORTRAIT);
-            if (horizontallyMirrored) mirrorTextureCoordinates(geometry.getTextureCoordinates());
+            geometry = PlayLikeCurlGeometry.createPage(role, 1, 1, PageOrientation.PORTRAIT);
+            if (horizontallyMirrored) {
+                mirrorTextureCoordinates(geometry.getTextureCoordinates());
+            }
             positionBuffer = directFloatBuffer(geometry.getPositions().length);
             textureBuffer = directFloatBuffer(geometry.getTextureCoordinates().length);
             indexBuffer = directShortBuffer(geometry.getIndices().length);
         }
 
         void initializeGl() {
+            dispose();
             GLES20.glGenBuffers(bufferIds.length, bufferIds, 0);
             positionBufferId = bufferIds[0];
             textureBufferId = bufferIds[1];
@@ -580,28 +1081,43 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
                 return;
             }
             geometry = PlayLikeCurlGeometry.createPage(role, width, height, orientation);
+            if (horizontallyMirrored) {
+                mirrorTextureCoordinates(geometry.getTextureCoordinates());
+            }
             geometryWidth = width;
             geometryHeight = height;
             geometryOrientation = orientation;
         }
 
         void uploadPositions() {
+            float[] positions = geometry.getPositions();
             positionBuffer.clear();
-            positionBuffer.put(geometry.getPositions()).position(0);
+            if (horizontallyMirrored) {
+                for (int offset = 0; offset < positions.length; offset += 3) {
+                    positionBuffer.put(1f - positions[offset]);
+                    positionBuffer.put(positions[offset + 1]);
+                    positionBuffer.put(positions[offset + 2]);
+                }
+            } else {
+                positionBuffer.put(positions);
+            }
+            positionBuffer.position(0);
             GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, positionBufferId);
             GLES20.glBufferSubData(
                     GLES20.GL_ARRAY_BUFFER,
                     0,
-                    geometry.getPositions().length * Float.BYTES,
+                    positions.length * Float.BYTES,
                     positionBuffer);
         }
 
-        void applyHorizontalMirrorToPositions() {
-            if (!horizontallyMirrored) return;
-            float[] positions = geometry.getPositions();
-            for (int offset = 0; offset < positions.length; offset += 3) {
-                positions[offset] = 1f - positions[offset];
+        void dispose() {
+            if (positionBufferId != 0 || textureBufferId != 0 || indexBufferId != 0) {
+                int[] ids = {positionBufferId, textureBufferId, indexBufferId};
+                GLES20.glDeleteBuffers(ids.length, ids, 0);
             }
+            positionBufferId = 0;
+            textureBufferId = 0;
+            indexBufferId = 0;
         }
     }
 
@@ -609,10 +1125,6 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
         for (int offset = 0; offset < coordinates.length; offset += 2) {
             coordinates[offset] = 1f - coordinates[offset];
         }
-    }
-
-    private static String safePath(String path) {
-        return path == null ? "" : path;
     }
 
     private static int createProgram(String vertexSource, String fragmentSource) {
@@ -627,7 +1139,8 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
         if (linkStatus[0] != GLES20.GL_TRUE) {
             String log = GLES20.glGetProgramInfoLog(createdProgram);
             GLES20.glDeleteProgram(createdProgram);
-            throw new IllegalStateException("Could not link PlayLikeCurl GLES2 program: " + log);
+            throw new IllegalStateException(
+                    "Could not link PlayLikeCurl GLES2 program: " + log);
         }
         GLES20.glDeleteShader(vertexShader);
         GLES20.glDeleteShader(fragmentShader);
@@ -643,7 +1156,8 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
         if (compileStatus[0] != GLES20.GL_TRUE) {
             String log = GLES20.glGetShaderInfoLog(shader);
             GLES20.glDeleteShader(shader);
-            throw new IllegalStateException("Could not compile PlayLikeCurl GLES2 shader: " + log);
+            throw new IllegalStateException(
+                    "Could not compile PlayLikeCurl GLES2 shader: " + log);
         }
         return shader;
     }
