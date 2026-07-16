@@ -1,96 +1,66 @@
 # PlayLikeCurl
 
-PlayLikeCurl is an Android page-turn rendering library. This maintained fork
-ports the original project from OpenGL ES 1.0 to OpenGL ES 2.0 and extends the
-demo with bidirectional portrait turns, dual-page landscape spreads, and fold
-shadows.
+PlayLikeCurl is a maintained Android library for deforming pre-rendered pages
+with a Google Play Books-style turn animation.
 
-![PlayLikeCurl demo](demo.gif)
+This fork modernizes
+[karankalsi/PlayLikeCurl](https://github.com/karankalsi/PlayLikeCurl) from
+OpenGL ES 1.0 to OpenGL ES 2.0 while preserving its page model and deformation
+behavior.
 
-## Changes In This Fork
+## Scope
 
-- OpenGL ES 2.0 shaders and buffer-backed rendering.
-- Forward and backward page turns.
-- Drag, fling, commit, and cancel settlement.
-- Portrait rendering with previous, current, and next pages.
-- Landscape rendering with previous, current, and next two-page spreads.
-- Landscape turns constrained to one leaf and the center binding.
-- A cast shadow that follows the fold.
-- Tests for geometry, page roles, texture order, settlement, and GLES2 usage.
+PlayLikeCurl owns:
 
-## Requirements
+- page-turn geometry and rendering
+- drag, fling, commit, and cancel settlement
+- forward and backward portrait turns
+- dual-page landscape turns bounded by the center binding
+- fold shadows
+- GPU texture validation and lifecycle
 
-- Android 7.0 (API 24) or newer.
-- JDK 17 or newer.
-- Android SDK API 37 to build the current project.
+The consuming reader owns:
 
-## Repository
+- document parsing and pagination
+- page preparation and caching
+- page identity and navigation state
+- overlays such as highlights or annotations
+- reader settings and persistence
 
-- `karackencurllib/` contains the reusable Android library.
-- `app/` contains the standalone demo.
-- `app/src/main/assets/portrait/` contains portrait sample pages.
-- `app/src/main/assets/landscape/` contains landscape sample pages.
+The library does not parse EPUB, PDF, or comic formats and does not fetch or
+cache document content.
 
-## Build And Run
+## Fork Status
 
-Run the library tests and assemble the demo APK:
+- OpenGL ES 2.0 shaders and buffer-backed rendering
+- Android 7.0 (API 24) minimum
+- portrait and landscape page-deck models
+- tests for the reference geometry, page roles, texture order, and settlement
+
+The `app` module is the executable reference for the current source API. The
+public integration contract will be documented here when it is released rather
+than exposing internal demo paths as a stable client API.
+
+## Build
+
+The repository contains:
+
+- `karackencurllib`: reusable Android library
+- `app`: standalone visual demo
+
+Run the library tests and build the demo:
 
 ```powershell
 .\gradlew.bat :karackencurllib:testDebugUnitTest :app:assembleDebug
 ```
 
-The APK is written to:
+JDK 17 and Android SDK API 37 are required to build the current checkout.
 
-```text
-app/build/outputs/apk/debug/app-debug.apk
-```
+## Distribution
 
-## Use From Source
+No Maven or JitPack artifact is published. Embed the library from source and pin
+the exact commit used by the consuming application.
 
-Include the library module in the consuming Gradle build:
+## License
 
-```groovy
-include ':karackencurllib'
-```
-
-Add the project dependency:
-
-```groovy
-dependencies {
-    implementation project(':karackencurllib')
-}
-```
-
-The API currently published on `master` reads page images from the consuming
-application's assets:
-
-```java
-import karacken.curl.PageCurlAdapter;
-import karacken.curl.PageSurfaceView;
-
-PageSurfaceView pageView = new PageSurfaceView(this);
-pageView.setLandscapeSpreadEnabled(false);
-pageView.setPageCurlAdapter(new PageCurlAdapter(new String[] {
-        "portrait/page1.png",
-        "portrait/page2.png",
-        "portrait/page3.png"
-}));
-pageView.setOnPageChangeListener(position -> {
-    // Persist or display the new zero-based page position.
-});
-
-setContentView(pageView);
-```
-
-Set `setLandscapeSpreadEnabled(true)` before installing the adapter to use the
-dual-page landscape model.
-
-No Maven or JitPack artifact is currently published. Pin a source revision when
-embedding the library.
-
-## Upstream And License
-
-This repository is a maintained fork of
-[karankalsi/PlayLikeCurl](https://github.com/karankalsi/PlayLikeCurl).
-
-The project is available under the [MIT License](LICENSE.txt).
+PlayLikeCurl remains available under the [MIT License](LICENSE.txt).
