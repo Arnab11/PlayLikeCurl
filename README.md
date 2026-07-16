@@ -1,78 +1,59 @@
 # PlayLikeCurl
 
-An Android page-turn renderer inspired by the interaction used in Google Play
-Books. This maintained fork modernizes the original PlayLikeCurl project from
-OpenGL ES 1.0 to OpenGL ES 2.0 while preserving its page model, deformation
-behavior, gesture mapping, and settlement rules.
+PlayLikeCurl is an Android page-turn rendering library. This maintained fork
+ports the original project from OpenGL ES 1.0 to OpenGL ES 2.0 and extends the
+demo with bidirectional portrait turns, dual-page landscape spreads, and fold
+shadows.
 
 ![PlayLikeCurl demo](demo.gif)
 
-## Features
+## Changes In This Fork
 
-- OpenGL ES 2.0 shaders and vertex/index buffers.
-- Bidirectional portrait page turns using the original three-page model.
-- Dual-page landscape transitions bounded by the center binding.
-- Fold cast shadow that follows the deformation edge.
-- Drag, fling, commit, and cancel settlement behavior.
-- Standalone Android sample application.
-- JVM tests and source guards for geometry, page roles, texture order, and the
-  GLES2 boundary.
+- OpenGL ES 2.0 shaders and buffer-backed rendering.
+- Forward and backward page turns.
+- Drag, fling, commit, and cancel settlement.
+- Portrait rendering with previous, current, and next pages.
+- Landscape rendering with previous, current, and next two-page spreads.
+- Landscape turns constrained to one leaf and the center binding.
+- A cast shadow that follows the fold.
+- Tests for geometry, page roles, texture order, settlement, and GLES2 usage.
 
-## How It Works
+## Requirements
 
-PlayLikeCurl deforms the active page using a sinusoidal profile:
-
-```text
-A * sin((2 * PI / wavelength) * x)
-```
-
-Where:
-
-- `A` controls the curl elevation.
-- `wavelength` controls the curl width.
-- `x` is the horizontal page position.
-
-Portrait mode retains the original left, center, and right page roles.
-Landscape mode applies the same deformation to individual half-width leaves so
-the animation cannot cross the center binding.
-
-## Repository Layout
-
-- `karackencurllib/` - reusable Android library.
-- `app/` - standalone demonstration application.
-
-The library currently accepts page image names through `PageCurlAdapter`. A
-client-provided bitmap/deck API is planned before the first stable library
-release.
-
-## Build
-
-Requirements:
-
+- Android 7.0 (API 24) or newer.
 - JDK 17 or newer.
-- Android SDK with API 37 installed.
+- Android SDK API 37 to build the current project.
 
-Build the library, run the unit tests, and assemble the sample:
+## Repository
+
+- `karackencurllib/` contains the reusable Android library.
+- `app/` contains the standalone demo.
+- `app/src/main/assets/portrait/` contains portrait sample pages.
+- `app/src/main/assets/landscape/` contains landscape sample pages.
+
+## Build And Run
+
+Run the library tests and assemble the demo APK:
 
 ```powershell
-.\gradlew.bat :karackencurllib:testDebugUnitTest :app:testDebugUnitTest :app:assembleDebug
+.\gradlew.bat :karackencurllib:testDebugUnitTest :app:assembleDebug
 ```
 
-The sample APK is generated under:
+The APK is written to:
 
 ```text
-app/build/outputs/apk/debug/
+app/build/outputs/apk/debug/app-debug.apk
 ```
 
 ## Use From Source
 
-Include both modules in the consuming Gradle build:
+Include the library module in the consuming Gradle build:
 
 ```groovy
-include ':app', ':karackencurllib'
+include ':karackencurllib'
 ```
 
-Add the library project as a dependency:
+Add the project dependency:
 
 ```groovy
 dependencies {
@@ -80,41 +61,36 @@ dependencies {
 }
 ```
 
-Create the view and provide page images stored in the application's assets:
+The API currently published on `master` reads page images from the consuming
+application's assets:
 
 ```java
 import karacken.curl.PageCurlAdapter;
 import karacken.curl.PageSurfaceView;
 
-PageSurfaceView pageSurfaceView = new PageSurfaceView(this);
-PageCurlAdapter adapter = new PageCurlAdapter(
-        new String[]{"page1.png", "page2.png", "page3.png"}
-);
-pageSurfaceView.setPageCurlAdapter(adapter);
-setContentView(pageSurfaceView);
+PageSurfaceView pageView = new PageSurfaceView(this);
+pageView.setLandscapeSpreadEnabled(false);
+pageView.setPageCurlAdapter(new PageCurlAdapter(new String[] {
+        "portrait/page1.png",
+        "portrait/page2.png",
+        "portrait/page3.png"
+}));
+pageView.setOnPageChangeListener(position -> {
+    // Persist or display the new zero-based page position.
+});
+
+setContentView(pageView);
 ```
 
-No Maven or JitPack artifact is currently published by this fork. Use a pinned
-source revision until a stable public API and release tag are available.
+Set `setLandscapeSpreadEnabled(true)` before installing the adapter to use the
+dual-page landscape model.
 
-## Project Status
+No Maven or JitPack artifact is currently published. Pin a source revision when
+embedding the library.
 
-The GLES2 modernization and standalone portrait/landscape demonstrations are
-working and covered by tests. The next compatibility boundary is a bounded
-client bitmap API with explicit page identity, lifecycle, settlement, and
-failure contracts.
+## Upstream And License
 
-## Credits
-
-This fork is based on
+This repository is a maintained fork of
 [karankalsi/PlayLikeCurl](https://github.com/karankalsi/PlayLikeCurl).
 
-References used by the original project:
-
-- [Harism Android Page Curl](https://github.com/harism/android_page_curl)
-- [Sine wave](https://en.wikipedia.org/wiki/Sine_wave)
-- [Android OpenGL ES documentation](https://developer.android.com/develop/ui/views/graphics/opengl)
-
-## License
-
-PlayLikeCurl is available under the [MIT License](LICENSE.txt).
+The project is available under the [MIT License](LICENSE.txt).
