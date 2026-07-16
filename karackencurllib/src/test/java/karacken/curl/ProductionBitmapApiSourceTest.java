@@ -7,6 +7,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Locale;
 import org.junit.Test;
 
 public class ProductionBitmapApiSourceTest {
@@ -191,18 +192,6 @@ public class ProductionBitmapApiSourceTest {
     }
 
     @Test
-    public void demoWaitsForCapabilitiesAndHandlesFailuresWithoutThrowing()
-            throws IOException {
-        String source = appSource("MainActivity.java");
-
-        assertTrue(source.contains("onCapabilitiesAvailable"));
-        assertTrue(source.contains("nextGenerationId"));
-        assertTrue(source.contains("Bitmap.Config.ARGB_8888"));
-        assertTrue(source.contains("setHasAlpha(false)"));
-        assertFalse(source.contains("throw new IllegalStateException(failure.getMessage()"));
-    }
-
-    @Test
     public void contextRehydrationRevalidatesAndReleasesOnlyFailedDecks()
             throws IOException {
         String source = source("PageRenderer.java");
@@ -218,16 +207,16 @@ public class ProductionBitmapApiSourceTest {
     @Test
     public void productionApiIsVersionedAndDocumented() throws IOException {
         String apiSource = source("PlayLikeCurlApi.java");
-        String changelog = Files.readString(
-                Path.of("../CHANGELOG.md"),
-                StandardCharsets.UTF_8);
+        String apiDocumentation = Files.readString(
+                Path.of("PRODUCTION_API.md"),
+                StandardCharsets.UTF_8).toLowerCase(Locale.ROOT);
 
         assertTrue(apiSource.contains("public static final int PRODUCTION_API_VERSION"));
-        assertTrue(changelog.contains("bitmap page decks"));
-        assertTrue(changelog.contains("bitmap lease"));
-        assertTrue(changelog.contains("opaque ARGB_8888 base pages"));
-        assertTrue(changelog.contains("premultiplied ARGB_8888 overlays"));
-        assertTrue(changelog.contains("context recreation"));
+        assertTrue(apiDocumentation.contains("bitmap page decks"));
+        assertTrue(apiDocumentation.contains("bitmap lease"));
+        assertTrue(apiDocumentation.contains("opaque argb_8888 base pages"));
+        assertTrue(apiDocumentation.contains("premultiplied argb_8888 overlays"));
+        assertTrue(apiDocumentation.contains("context recreation"));
     }
 
     @Test
@@ -247,12 +236,6 @@ public class ProductionBitmapApiSourceTest {
     private static String source(String fileName) throws IOException {
         return Files.readString(
                 Path.of("src/main/java/karacken/curl/" + fileName),
-                StandardCharsets.UTF_8);
-    }
-
-    private static String appSource(String fileName) throws IOException {
-        return Files.readString(
-                Path.of("../app/src/main/java/karacken/curleffect/" + fileName),
                 StandardCharsets.UTF_8);
     }
 

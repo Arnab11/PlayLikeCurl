@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.1 - 2026-07-16
+
+- Made the reusable library's tests self-contained when the module is vendored
+  into another Gradle build.
+- Moved the standalone-demo source assertion to the demo module.
+- Added module-local production bitmap API documentation.
+
 ## 1.1.0 - 2026-07-16
 
 - Added the versioned production API for client-prepared bitmap page decks.
