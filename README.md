@@ -45,7 +45,7 @@ No Maven or JitPack artifact is currently published. Include
 `karackencurllib` from source and pin the exact fork commit used by the
 application.
 
-Release `1.1.2` exposes production bitmap-deck API version `1`. The client
+Release `1.1.3` exposes production bitmap-deck API version `1`. The client
 prepares immutable page bitmaps, submits a complete portrait or landscape
 interaction window, and retains each accepted bitmap until the matching
 deck-release callback. Prepared edge taps can start the same reference

@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.3 - 2026-07-17
+
+- Kept the fold cast shadow attached to the raised curl edge under perspective.
+- Covered normal and mirrored turns across shallow, middle, and deep curl positions.
+
 ## 1.1.2 - 2026-07-16
 
 - Added `PageSurfaceView.turn(PageChange)` for prepared programmatic edge-tap
