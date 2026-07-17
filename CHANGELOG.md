@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.2 - 2026-07-16
+
+- Added `PageSurfaceView.turn(PageChange)` for prepared programmatic edge-tap
+  turns.
+- Reused the reference forward and backward settlement paths without adding
+  separate geometry or timing behavior.
+- Rejected programmatic turns when the deck is unavailable, settlement is
+  active, or the requested direction is outside the current boundary.
+
 ## 1.1.1 - 2026-07-16
 
 - Made the reusable library's tests self-contained when the module is vendored
