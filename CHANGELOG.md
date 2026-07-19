@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.4 - 2026-07-19
+
+- Propagated stable gesture identities through rejection, cancellation, and
+  asynchronous settlement callbacks while preserving the original listener API.
+- Covered repeated deck settlement to prevent pending-deck retention growth.
+
 ## 1.1.3 - 2026-07-17
 
 - Kept the fold cast shadow attached to the raised curl edge under perspective.
