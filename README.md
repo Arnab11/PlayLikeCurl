@@ -45,13 +45,13 @@ No Maven or JitPack artifact is currently published. Include
 `karackencurllib` from source and pin the exact fork commit used by the
 application.
 
-Release `1.1.4` exposes production bitmap-deck API version `1`. The client
-prepares immutable page bitmaps, submits a complete portrait or landscape
-interaction window, and retains each accepted bitmap until the matching
-deck-release callback. Prepared edge taps can start the same reference
-settlement as a completed drag through `PageSurfaceView.turn(PageChange)`.
+The `1.2.0` source checkpoint exposes production bitmap-deck API version `2`.
+In addition to immutable deck leases and prepared programmatic turns, clients
+can request bounded asynchronous ownership snapshots through a typed result.
+The snapshot joins a stable main-thread ownership epoch with GL texture state,
+and accepted requests transfer safely into terminal disposal ownership.
 
-The `app` module provides an executable fullscreen example of that API.
+The `app` module provides an executable fullscreen example of the API.
 The complete contract is documented in
 [`karackencurllib/PRODUCTION_API.md`](karackencurllib/PRODUCTION_API.md).
 

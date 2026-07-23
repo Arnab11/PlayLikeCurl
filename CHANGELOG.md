@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.0 source checkpoint - 2026-07-23
+
+- Advanced the production source contract to API version 2.
+- Added bounded asynchronous ownership requests with typed availability,
+  GL-queue, and callback-capacity outcomes.
+- Joined main-thread deck and lease ownership to GL texture counts through a
+  stable ownership epoch with stale-attempt retries.
+- Transferred accepted requests into bounded terminal disposal callbacks without
+  double ownership or late-attempt delivery.
+- Kept this checkpoint source-only; no artifact publication is implied.
+
 ## 1.1.4 - 2026-07-19
 
 - Propagated stable gesture identities through rejection, cancellation, and
