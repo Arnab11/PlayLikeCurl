@@ -214,7 +214,16 @@ public class Gles2RendererSourceTest {
         assertTrue(surfaceSource.contains(
                 "ownershipSnapshotCoordinator.request(callback)"));
         assertTrue(surfaceSource.contains(
+                "setOwnershipCallbackCapacityListener(Runnable listener)"));
+        assertTrue(surfaceSource.contains(
+                "clearOwnershipCallbackCapacityListener(Runnable listener)"));
+        assertTrue(surfaceSource.contains(
+                "ownershipSnapshotCapacityEdge"));
+        assertTrue(surfaceSource.contains(
                 "ownershipSnapshotCoordinator.drain()"));
+        assertTrue(startDispose.indexOf(
+                "ownershipSnapshotCoordinator.clearCapacityAvailableListener(")
+                < startDispose.indexOf("ownershipSnapshotCoordinator.drain()"));
         assertTrue(startDispose.indexOf("ownershipSnapshotCoordinator.drain()")
                 < startDispose.indexOf("disposeStarted = true"));
         assertTrue(surfaceSource.contains(

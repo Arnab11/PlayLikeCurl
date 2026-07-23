@@ -146,6 +146,7 @@ public class PageSurfaceView extends GLSurfaceView {
                             callback,
                             failure));
     private final PageSurfaceOwnershipSnapshotCoordinator ownershipSnapshotCoordinator;
+    private Runnable ownershipCallbackCapacityListener;
 
     private PageSurfaceListener pageSurfaceListener = NO_OP_LISTENER;
     private RenderCapabilities renderCapabilities;
@@ -177,6 +178,13 @@ public class PageSurfaceView extends GLSurfaceView {
     private float gestureDownX;
     private float gestureDownY;
     private OnPageChangeListener onPageChangeListener;
+    private final Runnable ownershipSnapshotCapacityEdge = () ->
+            mainHandler.post(() -> {
+                Runnable listener = ownershipCallbackCapacityListener;
+                if (!disposeStarted && listener != null) {
+                    listener.run();
+                }
+            });
 
     public PageSurfaceView(Context context) {
         super(context);
@@ -699,6 +707,24 @@ public class PageSurfaceView extends GLSurfaceView {
         }
     }
 
+    public void setOwnershipCallbackCapacityListener(Runnable listener) {
+        requireMainThread();
+        ownershipCallbackCapacityListener =
+                Objects.requireNonNull(listener, "listener");
+        ownershipSnapshotCoordinator.setCapacityAvailableListener(
+                ownershipSnapshotCapacityEdge);
+    }
+
+    public void clearOwnershipCallbackCapacityListener(Runnable listener) {
+        requireMainThread();
+        if (ownershipCallbackCapacityListener != listener) {
+            return;
+        }
+        ownershipCallbackCapacityListener = null;
+        ownershipSnapshotCoordinator.clearCapacityAvailableListener(
+                ownershipSnapshotCapacityEdge);
+    }
+
     public int getPendingCallbackCount() {
         requireMainThread();
         return requiredDisposeCallback.pendingCount()
@@ -744,6 +770,9 @@ public class PageSurfaceView extends GLSurfaceView {
         if (disposedResult != null || disposeStarted) {
             return;
         }
+        ownershipCallbackCapacityListener = null;
+        ownershipSnapshotCoordinator.clearCapacityAvailableListener(
+                ownershipSnapshotCapacityEdge);
         List<PageSurfaceOwnershipResult.Callback> ownershipCallbacks =
                 ownershipSnapshotCoordinator.drain();
         disposeStarted = true;
