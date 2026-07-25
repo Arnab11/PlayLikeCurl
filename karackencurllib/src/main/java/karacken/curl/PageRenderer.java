@@ -771,7 +771,7 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
 
     private boolean drawPortraitPage() {
         PageDisplayRect displayRect = displayRect(portraitFrontResource, fullViewportRect());
-        configureDisplayViewport(displayRect, PageOrientation.PORTRAIT);
+        configureDisplayViewport(displayRect, PageOrientation.PORTRAIT, 0f);
         int displayWidth = displayRect.getWidthPx();
         int displayHeight = displayRect.getHeightPx();
         boolean rtl = readingDirection == ReadingDirection.RIGHT_TO_LEFT;
@@ -912,7 +912,10 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
             PageState state,
             boolean active) {
         PageDisplayRect displayRect = displayRect(resource, fallbackDisplayRect);
-        configureDisplayViewport(displayRect, PageOrientation.PORTRAIT);
+        configureDisplayViewport(
+                displayRect,
+                PageOrientation.PORTRAIT,
+                PlayLikeCurlModel.RIGHT_DEPTH);
         int displayWidth = displayRect.getWidthPx();
         int displayHeight = displayRect.getHeightPx();
         if (active) {
@@ -964,7 +967,8 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
 
     private void configureDisplayViewport(
             PageDisplayRect displayRect,
-            PageOrientation orientation) {
+            PageOrientation orientation,
+            float restingPlaneDepth) {
         if (!displayRect.fitsWithin(viewportWidth, viewportHeight)) {
             throw new IllegalArgumentException(
                     "Page display rectangle exceeds the renderer surface");
@@ -974,7 +978,11 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
                 displayRect.glBottomPx(viewportHeight),
                 displayRect.getWidthPx(),
                 displayRect.getHeightPx());
-        updateMvp(displayRect.getWidthPx(), displayRect.getHeightPx(), orientation);
+        updateMvp(
+                displayRect.getWidthPx(),
+                displayRect.getHeightPx(),
+                orientation,
+                restingPlaneDepth);
     }
 
     private boolean drawMovingPage(
@@ -1046,7 +1054,11 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
         GLES20.glUniformMatrix4fv(shadowMatrixUniform, 1, false, mvpMatrix, 0);
         GLES20.glUniform1f(shadowOpacityUniform, shadow.getOpacity());
         GLES20.glEnable(GLES20.GL_BLEND);
-        GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA);
+        GLES20.glBlendFuncSeparate(
+                GLES20.GL_SRC_ALPHA,
+                GLES20.GL_ONE_MINUS_SRC_ALPHA,
+                GLES20.GL_ONE,
+                GLES20.GL_ONE_MINUS_SRC_ALPHA);
         GLES20.glDepthMask(false);
         GLES20.glDisable(GLES20.GL_DEPTH_TEST);
         GLES20.glEnableVertexAttribArray(shadowPositionAttribute);
@@ -1165,7 +1177,11 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
         return texture != null && texture.uploaded ? texture : null;
     }
 
-    private void updateMvp(int width, int height, PageOrientation orientation) {
+    private void updateMvp(
+            int width,
+            int height,
+            PageOrientation orientation,
+            float restingPlaneDepth) {
         Matrix.perspectiveM(
                 projectionMatrix,
                 0,
@@ -1175,7 +1191,8 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
                 100f);
         Matrix.setIdentityM(modelMatrix, 0);
         Matrix.translateM(modelMatrix, 0, 0f, 0f, -PlayLikeCurlGeometry.CAMERA_DISTANCE);
-        float scale = PlayLikeCurlGeometry.restingPlaneScale(width, height, orientation);
+        float scale = PlayLikeCurlGeometry.restingPlaneScale(
+                width, height, orientation, restingPlaneDepth);
         Matrix.scaleM(modelMatrix, 0, scale, scale, 1f);
         Matrix.translateM(modelMatrix, 0, -0.5f, -0.5f, 0f);
         Matrix.multiplyMM(mvpMatrix, 0, projectionMatrix, 0, modelMatrix, 0);

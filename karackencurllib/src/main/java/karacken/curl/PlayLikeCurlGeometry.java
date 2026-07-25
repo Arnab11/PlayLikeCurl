@@ -72,7 +72,14 @@ final class PlayLikeCurlGeometry {
     }
 
     static float visiblePlaneHeight() {
-        float restingDistance = CAMERA_DISTANCE - PlayLikeCurlModel.RIGHT_DEPTH;
+        return visiblePlaneHeight(PlayLikeCurlModel.RIGHT_DEPTH);
+    }
+
+    static float visiblePlaneHeight(float planeDepth) {
+        if (!Float.isFinite(planeDepth) || planeDepth >= CAMERA_DISTANCE) {
+            throw new IllegalArgumentException("Plane depth must remain in front of the camera");
+        }
+        float restingDistance = CAMERA_DISTANCE - planeDepth;
         return (float) (2f
                 * restingDistance
                 * Math.tan(Math.toRadians(FIELD_OF_VIEW_DEGREES / 2f)));
@@ -82,7 +89,16 @@ final class PlayLikeCurlGeometry {
             int width,
             int height,
             PageOrientation orientation) {
-        return visiblePlaneHeight() / pageRatio(width, height, orientation);
+        return restingPlaneScale(
+                width, height, orientation, PlayLikeCurlModel.RIGHT_DEPTH);
+    }
+
+    static float restingPlaneScale(
+            int width,
+            int height,
+            PageOrientation orientation,
+            float planeDepth) {
+        return visiblePlaneHeight(planeDepth) / pageRatio(width, height, orientation);
     }
 
     static float foldEdgeX(PageRole role, float curlPosition) {

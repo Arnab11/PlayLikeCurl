@@ -57,6 +57,10 @@ public class Gles2RendererSourceTest {
         assertTrue(source.contains("mirroredLeftMesh"));
         assertTrue(source.contains("mirroredFrontMesh"));
         assertTrue(source.contains("drawPortraitPage"));
+        assertTrue(source.contains(
+                "configureDisplayViewport(displayRect, PageOrientation.PORTRAIT, 0f)"));
+        assertTrue(source.contains("PlayLikeCurlModel.RIGHT_DEPTH"));
+        assertTrue(source.contains("restingPlaneDepth"));
     }
 
     @Test
@@ -94,9 +98,11 @@ public class Gles2RendererSourceTest {
         assertTrue(source.contains("SHADOW_FRAGMENT_SHADER"));
         assertTrue(source.contains("drawFoldShadow"));
         assertTrue(source.contains("GLES20.glEnable(GLES20.GL_BLEND)"));
-        assertTrue(source.contains("GLES20.glBlendFunc("));
+        assertTrue(source.contains("GLES20.glBlendFuncSeparate("));
         assertTrue(source.contains("GLES20.GL_SRC_ALPHA"));
         assertTrue(source.contains("GLES20.GL_ONE_MINUS_SRC_ALPHA"));
+        assertTrue(source.contains("GLES20.GL_ONE,"));
+        assertFalse(source.contains("GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA"));
     }
 
     @Test
