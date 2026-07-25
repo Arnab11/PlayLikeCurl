@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.1 - 2026-07-25
+
+- Treat terminal disposal with no holder surface and no logical attachment as a
+  successful detached fallback after renderer state and deck leases are abandoned.
+- Preserve typed failures for resume, queue, queue-entry timeout, and surface-loss
+  failures while the renderer remains logically attached.
+
 ## 1.2.0 source checkpoint - 2026-07-23
 
 - Advanced the production source contract to API version 2.

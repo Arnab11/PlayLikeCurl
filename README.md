@@ -45,7 +45,7 @@ No Maven or JitPack artifact is currently published. Include
 `karackencurllib` from source and pin the exact fork commit used by the
 application.
 
-The `1.2.0` source checkpoint exposes production bitmap-deck API version `2`.
+The `1.2.1` source checkpoint exposes production bitmap-deck API version `2`.
 In addition to immutable deck leases and prepared programmatic turns, clients
 can request bounded asynchronous ownership snapshots through a typed result.
 The snapshot joins a stable main-thread ownership epoch with GL texture state,
