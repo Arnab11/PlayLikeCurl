@@ -102,6 +102,28 @@ public class ProductionBitmapApiSourceTest {
     }
 
     @Test
+    public void surfaceAvailabilityRetriesOwnershipAdmission() throws IOException {
+        String source = source("PageSurfaceView.java");
+        String retryBody = methodBody(source, "private void scheduleOwnershipRetryEdge()");
+        String attachBody = methodBody(source, "public void attach()");
+        String windowAttachBody = methodBody(source, "protected void onAttachedToWindow()");
+        String surfaceCreatedBody = methodBody(
+                source,
+                "public void surfaceCreated(SurfaceHolder holder)");
+        String listenerBody = methodBody(
+                source,
+                "public void setOwnershipCallbackCapacityListener(Runnable listener)");
+
+        assertTrue(retryBody.contains("requireMainThread()"));
+        assertTrue(retryBody.contains("ownershipRetryEdge.schedule()"));
+        assertTrue(attachBody.contains("scheduleOwnershipRetryEdge()"));
+        assertTrue(windowAttachBody.contains("scheduleOwnershipRetryEdge()"));
+        assertTrue(surfaceCreatedBody.contains("scheduleOwnershipRetryEdge()"));
+        assertTrue(listenerBody.contains("ownershipCallbackCapacityListener == exact"));
+        assertTrue(listenerBody.contains("scheduleOwnershipRetryEdge()"));
+    }
+
+    @Test
     public void rejectedDownQuarantinesTheRemainingTouchSequence() throws IOException {
         String source = source("PageSurfaceView.java");
 
@@ -195,6 +217,23 @@ public class ProductionBitmapApiSourceTest {
         assertTrue(source.contains("gestureMoved"));
         assertTrue(source.contains("if (!gestureMoved)"));
         assertFalse(source.contains("settle(interaction.release());\n                performClick();"));
+    }
+
+    @Test
+    public void dragReleaseUsesTheFinalPointerPosition() throws IOException {
+        String source = source("PageSurfaceView.java");
+        String touchBody = methodBody(source, "private boolean handlePageTouchEvent");
+        String actionUp = touchBody.substring(
+                touchBody.indexOf("case MotionEvent.ACTION_UP:"),
+                touchBody.indexOf("case MotionEvent.ACTION_CANCEL:"));
+
+        assertTrue(actionUp.contains("dragInteraction(event.getX())"));
+        assertTrue(
+                actionUp.indexOf("dragInteraction(event.getX())")
+                        < actionUp.indexOf("computeCurrentVelocity(1000)"));
+        assertTrue(
+                actionUp.indexOf("dragInteraction(event.getX())")
+                        < actionUp.indexOf("interaction.release()"));
     }
 
     @Test
