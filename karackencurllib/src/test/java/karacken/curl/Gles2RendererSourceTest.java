@@ -79,6 +79,33 @@ public class Gles2RendererSourceTest {
     }
 
     @Test
+    public void rendererOwnsFixedPageBackingForEveryCurlFrame() throws IOException {
+        String source = source("PageRenderer.java");
+        String portrait = methodBody(source, "private boolean drawPortraitPage()");
+        String landscape = methodBody(source, "private boolean drawLandscapeSpread()");
+        String backing = methodBody(
+                source,
+                "private void drawPageBacking(PageImage<Bitmap> resource)");
+
+        assertTrue(portrait.contains("drawPageBacking(portraitFrontResource)"));
+        assertTrue(portrait.indexOf("drawPageBacking(portraitFrontResource)")
+                < portrait.indexOf("if (portraitModel.getActivePage()"));
+        assertTrue(landscape.contains("drawPageBacking(spreadCurrentLeftResource)"));
+        assertTrue(landscape.contains("drawPageBacking(spreadCurrentRightResource)"));
+        assertTrue(landscape.indexOf("drawPageBacking(spreadCurrentLeftResource)")
+                < landscape.indexOf("LandscapeSpreadTransition transition"));
+        assertTrue(landscape.indexOf("drawPageBacking(spreadCurrentRightResource)")
+                < landscape.indexOf("LandscapeSpreadTransition transition"));
+        assertTrue(backing.contains("resource.hasBacking()"));
+        assertTrue(backing.contains("GLES20.glEnable(GLES20.GL_SCISSOR_TEST)"));
+        assertTrue(backing.contains("GLES20.glScissor("));
+        assertTrue(backing.contains("GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)"));
+        assertTrue(backing.contains("finally"));
+        assertTrue(backing.contains("GLES20.glClearColor(0f, 0f, 0f, 0f)"));
+        assertTrue(backing.contains("GLES20.glDisable(GLES20.GL_SCISSOR_TEST)"));
+    }
+
+    @Test
     public void hiddenSurfacePresentationWaitsForAnArmedCompleteFrame() throws IOException {
         String source = Files.readString(
                 Path.of("src/main/java/karacken/curl/PageSurfaceView.java"),
@@ -374,6 +401,34 @@ public class Gles2RendererSourceTest {
                 < surfaceDestroyed.indexOf("terminalDisposalGate.onSurfaceUnavailable"));
         assertTrue(detached.indexOf("super.onDetachedFromWindow()")
                 < detached.indexOf("terminalDisposalGate.onSurfaceUnavailable"));
+    }
+
+    @Test
+    public void dynamicPageOverlaysReplaceOnlyTheCurrentTextureAndUseThePageMesh()
+            throws IOException {
+        String surface = source("PageSurfaceView.java");
+        String renderer = source("PageRenderer.java");
+        String replace = methodBody(
+                surface,
+                "public PageOverlayUpdateResult replacePageOverlays(");
+        String draw = methodBody(
+                renderer,
+                "private boolean drawPage(");
+        String overlayLookup = methodBody(
+                renderer,
+                "private GpuTexture overlayTexture(PageImage<Bitmap> page)");
+
+        assertTrue(surface.contains("PageOverlayUpdateGate.evaluate("));
+        assertTrue(replace.contains("gestureAccepted || settlementRunning"));
+        assertTrue(replace.contains("renderer.replacePageOverlays("));
+        assertTrue(renderer.contains("PageOverlayReplacementStore<String, DynamicPageOverlayTexture>"));
+        assertTrue(renderer.contains("dynamicPageOverlays.replace("));
+        assertTrue(renderer.contains("dynamicPageOverlays.clear()"));
+        assertTrue(overlayLookup.contains("dynamicPageOverlays.get(page.identityKey())"));
+        assertTrue(draw.contains("GpuTexture overlayTexture = overlayTexture(resource)"));
+        assertTrue(draw.indexOf("mesh.ensureGeometry(") < draw.indexOf("drawPageTextures("));
+        assertTrue(draw.indexOf("drawPageTextures(") < draw.indexOf("GLES20.glDrawElements("));
+        assertTrue(renderer.contains("bitmap.recycle()"));
     }
 
     @Test
