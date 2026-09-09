@@ -23,6 +23,16 @@ import javax.microedition.khronos.opengles.GL10;
 
 /** GLES2 renderer for client-prepared page bitmaps and PlayLikeCurl deformation. */
 public final class PageRenderer implements GLSurfaceView.Renderer {
+    enum ReleaseCleanupStage {
+        OVERLAY,
+        TEXTURE
+    }
+
+    @FunctionalInterface
+    interface ReleaseCleanupFaultInjector {
+        void beforeCleanup(ReleaseCleanupStage stage, int index);
+    }
+
     interface Events {
         void onCapabilitiesAvailable(RenderCapabilities capabilities);
 
@@ -90,6 +100,7 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
     private static final long DEFAULT_GPU_BUDGET_BYTES = 128L * 1024L * 1024L;
 
     private final Events events;
+    private final ReleaseCleanupFaultInjector releaseCleanupFaultInjector;
     private final GpuMesh leftMesh = new GpuMesh(PageRole.LEFT);
     private final GpuMesh frontMesh = new GpuMesh(PageRole.FRONT);
     private final GpuMesh mirroredLeftMesh = new GpuMesh(PageRole.LEFT, true);
@@ -97,7 +108,7 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
     private final GpuMesh rightMesh = new GpuMesh(PageRole.RIGHT);
     private final GpuMesh mirroredRightMesh = new GpuMesh(PageRole.RIGHT, true);
     private final Map<String, GpuTexture> textureCache = new LinkedHashMap<>();
-    private final PageOverlayReplacementStore<String, DynamicPageOverlayTexture>
+    private PageOverlayReplacementStore<String, DynamicPageOverlayTexture>
             dynamicPageOverlays = new PageOverlayReplacementStore<>(
                     DynamicPageOverlayTexture::dispose);
     private final AtomicLong dynamicPageOverlayEpoch = new AtomicLong();
@@ -121,6 +132,18 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
     private LandscapeSpreadModel landscapeSpreadModel;
     private PageDeck<Bitmap> activeDeck;
     private PageDeck<Bitmap> replacementDeck;
+    private long selectedFrameGeneration = -1L;
+    // The surface release record remains the lease owner until this renderer acknowledges it.
+    private DeckReleaseReason selectedReleaseReason;
+    private ReplacementDrawState replacementDrawState;
+
+    private final class ReplacementDrawState {
+        final PlayLikeCurlModel portrait = portraitModel;
+        final LandscapeSpreadModel landscape = landscapeSpreadModel;
+        final PageOverlayReplacementStore<String, DynamicPageOverlayTexture> overlays =
+                dynamicPageOverlays;
+    }
+
     private PageImage<Bitmap> portraitLeftResource;
     private PageImage<Bitmap> portraitFrontResource;
     private PageImage<Bitmap> portraitRightResource;
@@ -156,7 +179,16 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
     private boolean disposed;
 
     PageRenderer(Events events) {
-        this.events = events;
+        this(events, (stage, index) -> {});
+    }
+
+    PageRenderer(
+            Events events,
+            ReleaseCleanupFaultInjector releaseCleanupFaultInjector) {
+        this.events = Objects.requireNonNull(events, "events");
+        this.releaseCleanupFaultInjector = Objects.requireNonNull(
+                releaseCleanupFaultInjector,
+                "releaseCleanupFaultInjector");
     }
 
     void setReadingDirection(ReadingDirection readingDirection) {
@@ -176,6 +208,71 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
                 : !logicalNext;
     }
 
+    void setSelectedFrameGeneration(long generationId) {
+        if (selectedFrameGeneration == generationId || disposed) return;
+        long previous = selectedFrameGeneration;
+        DeckReleaseReason release = selectedReleaseReason;
+        selectedFrameGeneration = generationId;
+        selectedReleaseReason = null;
+        if (release != null) releaseDeck(previous, release);
+    }
+
+    boolean hasActiveFrame(long generationId) {
+        return !disposed && generationId >= 0 && generation(activeDeck) == generationId;
+    }
+
+    /** Called only after the GL thread is paused; retaining client material is not GL proof. */
+    boolean retainsValidFrame(
+            long generationId,
+            java.util.function.Consumer<RenderFailure> onInvalidMaterial) {
+        PageDeck<Bitmap> deck = generation(activeDeck) == generationId ? activeDeck
+                : generation(replacementDeck) == generationId ? replacementDeck : null;
+        if (disposed || deck == null) return false;
+        try {
+            validateDeck(deck);
+            return true;
+        } catch (RuntimeException invalidMaterial) {
+            // This validation runs on main before lease retirement, not on the GL queue.
+            onInvalidMaterial.accept(new RenderFailure(generationId, true, RenderFailureReason.BITMAP,
+                    "Selected retained material is unavailable", invalidMaterial));
+            return false;
+        }
+    }
+
+    /** Rolls back only the still-selected material, never an obsolete authority selection. */
+    boolean restoreSelectedFrame(long candidateGeneration) {
+        if (disposed || generation(activeDeck) != candidateGeneration
+                || selectedFrameGeneration < 0
+                || generation(replacementDeck) != selectedFrameGeneration) return false;
+        try {
+            validateDeck(replacementDeck);
+        } catch (RuntimeException invalidMaterial) {
+            reportFailure(selectedFrameGeneration, true, RenderFailureReason.BITMAP,
+                    "Selected rollback material is unavailable", invalidMaterial);
+            releaseDeck(selectedFrameGeneration, DeckReleaseReason.FAILED);
+            return false;
+        }
+        swapPreparedDeck();
+        return true;
+    }
+
+    private void swapPreparedDeck() {
+        PageDeck<Bitmap> previous = activeDeck;
+        ReplacementDrawState previousState = previous == null ? null : new ReplacementDrawState();
+        ReplacementDrawState nextState = replacementDrawState;
+        activeDeck = replacementDeck;
+        replacementDeck = previous;
+        replacementDrawState = previousState;
+        dynamicPageOverlays = new PageOverlayReplacementStore<>(DynamicPageOverlayTexture::dispose);
+        applyActiveDeck(activeDeck);
+        if (nextState != null) {
+            portraitModel = nextState.portrait;
+            landscapeSpreadModel = nextState.landscape;
+            dynamicPageOverlays = nextState.overlays;
+        }
+        retainDeckTextures();
+    }
+
     void prepareDeck(PageDeck<Bitmap> deck, boolean activateWhenPrepared) {
         if (disposed) {
             reportFailure(
@@ -190,28 +287,43 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
         boolean retained = false;
         try {
             validateDeck(deck);
-            PageDeck<Bitmap> prospectiveActive =
-                    activateWhenPrepared ? deck : activeDeck;
-            PageDeck<Bitmap> prospectivePending =
-                    activateWhenPrepared ? null : deck;
+            boolean selectedActive = selectedFrameGeneration >= 0
+                    && generation(activeDeck) == selectedFrameGeneration
+                    && deck.getGenerationId() != selectedFrameGeneration;
+            boolean stage = !activateWhenPrepared || selectedActive;
+            if ((selectedFrameGeneration >= 0
+                    && generation(replacementDeck) == selectedFrameGeneration
+                    && deck.getGenerationId() != selectedFrameGeneration)
+                    || (selectedActive && replacementDeck != null
+                    && generation(replacementDeck) != deck.getGenerationId())) {
+                reportFailure(deck.getGenerationId(), true,
+                        RenderFailureReason.GPU_BUDGET_EXCEEDED,
+                        "Both renderer deck slots are still occupied", null);
+                events.onDeckReleased(deck.getGenerationId(), DeckReleaseReason.FAILED);
+                return;
+            }
+            PageDeck<Bitmap> prospectiveActive = stage ? activeDeck : deck;
+            PageDeck<Bitmap> prospectivePending = stage ? deck : null;
             TextureBudget.Result budget = TextureBudget.evaluate(
                     prospectiveActive,
                     prospectivePending,
                     maxTextureSize,
-                    gpuBudgetBytes);
+                    gpuBudgetBytes,
+                    stage ? dynamicPageOverlayBytes() : 0L);
             if (budget.getFailureReason() != null) {
                 reportBudgetFailure(deck.getGenerationId(), budget);
                 events.onDeckReleased(deck.getGenerationId(), DeckReleaseReason.FAILED);
                 return;
             }
-            if (activateWhenPrepared) {
+            if (!stage) {
                 activeDeck = deck;
                 replacementDeck = null;
+                retained = true;
                 applyActiveDeck(deck);
             } else {
                 replacementDeck = deck;
+                retained = true;
             }
-            retained = true;
             retainDeckTextures();
             if (glReady) {
                 uploadDeck(deck);
@@ -245,16 +357,27 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
             return;
         }
         if (replacementDeck != null && replacementDeck.getGenerationId() == generationId) {
-            PageDeck<Bitmap> releasedDeck = activeDeck;
-            activeDeck = replacementDeck;
-            replacementDeck = null;
-            applyActiveDeck(activeDeck);
-            retainDeckTextures();
-            if (releasedDeck != null
-                    && releasedDeck.getGenerationId() != activeDeck.getGenerationId()) {
-                events.onDeckReleased(
-                        releasedDeck.getGenerationId(),
-                        DeckReleaseReason.REPLACED);
+            // A retained selected predecessor is activated only by conditional rollback.
+            if (generation(replacementDeck) == selectedFrameGeneration) return;
+            long previous = generation(activeDeck);
+            boolean retainSelected = previous >= 0 && previous == selectedFrameGeneration;
+            if (retainSelected && selectedReleaseReason == null) {
+                selectedReleaseReason = DeckReleaseReason.REPLACED;
+            }
+            Throwable failure = PageRendererReleaseTerminal.execute(
+                    () -> {
+                        if (previous >= 0 && !retainSelected) {
+                            releaseDeck(previous, DeckReleaseReason.REPLACED);
+                        }
+                    },
+                    this::swapPreparedDeck);
+            if (failure != null) {
+                reportFailure(
+                        generationId,
+                        true,
+                        RenderFailureReason.TEXTURE_UPLOAD,
+                        "Could not fully activate page deck",
+                        failure);
             }
         }
     }
@@ -425,6 +548,8 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
         long[] total = {0L};
         dynamicPageOverlays.forEach(texture ->
                 total[0] = Math.addExact(total[0], texture.gpuBytes()));
+        if (replacementDrawState != null) replacementDrawState.overlays.forEach(texture ->
+                total[0] = Math.addExact(total[0], texture.gpuBytes()));
         return total[0];
     }
 
@@ -458,19 +583,142 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
     }
 
     void releaseDeck(long generationId, DeckReleaseReason reason) {
-        boolean released = false;
-        if (activeDeck != null && activeDeck.getGenerationId() == generationId) {
+        if (!disposed && generationId == selectedFrameGeneration
+                && reason != DeckReleaseReason.FAILED && reason != DeckReleaseReason.DISPOSED
+                && (generation(activeDeck) == generationId
+                    || generation(replacementDeck) == generationId)) {
+            if (selectedReleaseReason == null) selectedReleaseReason = reason;
+            return;
+        }
+        // A cancelled/failed candidate cannot leave a valid selected predecessor off-screen.
+        restoreSelectedFrame(generationId);
+        if (generationId == selectedFrameGeneration) selectedReleaseReason = null;
+        ReleasedClientState released = detachClientState(generationId);
+        Throwable failure = PageRendererReleaseTerminal.execute(
+                () -> events.onDeckReleased(generationId, reason),
+                released::cleanupGl);
+        if (failure != null) {
+            reportFailure(
+                    generationId,
+                    true,
+                    RenderFailureReason.TEXTURE_UPLOAD,
+                    "Could not fully release page deck",
+                    failure);
+        }
+    }
+
+    boolean terminallyAbandonDeck(long generationId) {
+        ReleasedClientState released = detachClientState(generationId);
+        if (!released.detached) {
+            return false;
+        }
+        released.abandonClientResources();
+        return true;
+    }
+
+    private ReleasedClientState detachClientState(long generationId) {
+        boolean releasesActive = generation(activeDeck) == generationId
+                || activeResourcesRetain(generationId);
+        boolean releasesReplacement = generation(replacementDeck) == generationId;
+        boolean detached = releasesActive || releasesReplacement;
+        if (releasesActive) {
             activeDeck = null;
-            clearActiveDeck();
-            released = true;
+            portraitModel = null;
+            landscapeSpreadModel = null;
+            clearPortraitResources();
+            clearSpreadResources();
         }
-        if (replacementDeck != null && replacementDeck.getGenerationId() == generationId) {
+        if (releasesReplacement) {
             replacementDeck = null;
-            released = true;
         }
-        retainDeckTextures();
-        if (released) {
-            events.onDeckReleased(generationId, reason);
+        List<DynamicPageOverlayTexture> overlays = releasesActive
+                ? dynamicPageOverlays.detachAll()
+                : new ArrayList<>();
+        if (releasesReplacement && replacementDrawState != null) {
+            overlays.addAll(replacementDrawState.overlays.detachAll());
+            replacementDrawState = null;
+        }
+        if (generationId == selectedFrameGeneration) selectedReleaseReason = null;
+        List<GpuTexture> textures = detachGenerationTextures(generationId);
+        return new ReleasedClientState(
+                detached || !overlays.isEmpty() || !textures.isEmpty(),
+                overlays,
+                textures);
+    }
+
+    private boolean activeResourcesRetain(long generationId) {
+        return generation(portraitLeftResource) == generationId
+                || generation(portraitFrontResource) == generationId
+                || generation(portraitRightResource) == generationId
+                || generation(spreadPreviousLeftResource) == generationId
+                || generation(spreadPreviousRightResource) == generationId
+                || generation(spreadCurrentLeftResource) == generationId
+                || generation(spreadCurrentRightResource) == generationId
+                || generation(spreadNextLeftResource) == generationId
+                || generation(spreadNextRightResource) == generationId;
+    }
+
+    private static long generation(PageDeck<?> deck) {
+        return deck == null ? -1L : deck.getGenerationId();
+    }
+
+    private static long generation(PageImage<?> page) {
+        return page == null ? -1L : page.getGenerationId();
+    }
+
+    private List<GpuTexture> detachGenerationTextures(long generationId) {
+        List<GpuTexture> detached = new ArrayList<>();
+        Iterator<Map.Entry<String, GpuTexture>> iterator =
+                textureCache.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<String, GpuTexture> entry = iterator.next();
+            if (entry.getValue().page.getGenerationId() == generationId) {
+                detached.add(entry.getValue());
+                iterator.remove();
+            }
+        }
+        return detached;
+    }
+
+    private final class ReleasedClientState {
+        private final boolean detached;
+        private final List<DynamicPageOverlayTexture> overlays;
+        private final List<GpuTexture> textures;
+
+        ReleasedClientState(
+                boolean detached,
+                List<DynamicPageOverlayTexture> overlays,
+                List<GpuTexture> textures) {
+            this.detached = detached;
+            this.overlays = overlays;
+            this.textures = textures;
+        }
+
+        void cleanupGl() {
+            DisposalFailure failure = new DisposalFailure();
+            for (int index = 0; index < overlays.size(); index += 1) {
+                int cleanupIndex = index;
+                DynamicPageOverlayTexture overlay = overlays.get(index);
+                failure.capture(() -> releaseCleanupFaultInjector.beforeCleanup(
+                        ReleaseCleanupStage.OVERLAY,
+                        cleanupIndex));
+                failure.capture(overlay::dispose);
+            }
+            for (int index = 0; index < textures.size(); index += 1) {
+                int cleanupIndex = index;
+                GpuTexture texture = textures.get(index);
+                failure.capture(() -> releaseCleanupFaultInjector.beforeCleanup(
+                        ReleaseCleanupStage.TEXTURE,
+                        cleanupIndex));
+                failure.capture(texture::deleteGl);
+            }
+            failure.throwIfPresent();
+        }
+
+        void abandonClientResources() {
+            for (DynamicPageOverlayTexture overlay : overlays) {
+                overlay.abandonClientResource();
+            }
         }
     }
 
@@ -489,16 +737,24 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
         disposed = true;
         activeDeck = null;
         replacementDeck = null;
-        clearActiveDeck();
-        glReady = false;
+        portraitModel = null;
+        landscapeSpreadModel = null;
+        clearPortraitResources();
+        clearSpreadResources();
+        List<DynamicPageOverlayTexture> overlays = dynamicPageOverlays.detachAll();
+        if (replacementDrawState != null) {
+            overlays.addAll(replacementDrawState.overlays.detachAll());
+            replacementDrawState = null;
+        }
+        selectedReleaseReason = null;
+        selectedFrameGeneration = -1L;
+        List<GpuTexture> textures = new ArrayList<>(textureCache.values());
+        textureCache.clear();
 
         DisposalFailure failure = new DisposalFailure();
-        List<GpuTexture> textures =
-                new ArrayList<>(textureCache.values());
-        textureCache.clear();
-        for (GpuTexture texture : textures) {
-            failure.capture(texture::deleteGl);
-        }
+        failure.capture(
+                new ReleasedClientState(true, overlays, textures)::cleanupGl);
+        glReady = false;
 
         failure.capture(leftMesh::dispose);
         failure.capture(frontMesh::dispose);
@@ -559,7 +815,8 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
     }
 
     int textureCount() {
-        return textureCache.size() + dynamicPageOverlays.size();
+        return textureCache.size() + dynamicPageOverlays.size()
+                + (replacementDrawState == null ? 0 : replacementDrawState.overlays.size());
     }
 
     int textureLimit() {
@@ -580,8 +837,22 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
         disposed = true;
         activeDeck = null;
         replacementDeck = null;
+        portraitModel = null;
+        landscapeSpreadModel = null;
+        clearPortraitResources();
+        clearSpreadResources();
         glReady = false;
-        clearActiveDeck();
+        for (DynamicPageOverlayTexture overlay : dynamicPageOverlays.detachAll()) {
+            overlay.abandonClientResource();
+        }
+        if (replacementDrawState != null) {
+            for (DynamicPageOverlayTexture overlay : replacementDrawState.overlays.detachAll()) {
+                overlay.abandonClientResource();
+            }
+            replacementDrawState = null;
+        }
+        selectedReleaseReason = null;
+        selectedFrameGeneration = -1L;
         textureCache.clear();
     }
 
@@ -593,6 +864,7 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
         appliedPageOverlayEpoch = dynamicPageOverlayEpoch.get();
         glReady = false;
         dynamicPageOverlays.clear();
+        if (replacementDrawState != null) replacementDrawState.overlays.clear();
         try {
             program = createProgram(VERTEX_SHADER, FRAGMENT_SHADER);
             positionAttribute = GLES20.glGetAttribLocation(program, "aPosition");
@@ -720,8 +992,8 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
                 colorChannel(color, 24));
     }
 
-    private void applyActiveDeck(PageDeck<Bitmap> deck) {
-        dynamicPageOverlays.clear();
+    void applyActiveDeck(PageDeck<Bitmap> deck) {
+        List<DynamicPageOverlayTexture> overlays = dynamicPageOverlays.detachAll();
         if (deck instanceof PortraitPageDeck) {
             PortraitPageDeck<Bitmap> portrait = (PortraitPageDeck<Bitmap>) deck;
             portraitLeftResource = portrait.getPrevious();
@@ -744,14 +1016,7 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
         } else {
             throw new IllegalArgumentException("Unsupported page deck type");
         }
-    }
-
-    private void clearActiveDeck() {
-        dynamicPageOverlays.clear();
-        portraitModel = null;
-        landscapeSpreadModel = null;
-        clearPortraitResources();
-        clearSpreadResources();
+        new ReleasedClientState(false, overlays, new ArrayList<>()).cleanupGl();
     }
 
     private void clearPortraitResources() {
@@ -959,21 +1224,23 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
         }
     }
 
-    private void retainDeckTextures() {
+    void retainDeckTextures() {
         Set<String> retainedKeys = new LinkedHashSet<>();
         collectDeckKeys(activeDeck, retainedKeys);
         collectDeckKeys(replacementDeck, retainedKeys);
+        List<GpuTexture> detached = new ArrayList<>();
         Iterator<Map.Entry<String, GpuTexture>> iterator =
                 textureCache.entrySet().iterator();
         while (iterator.hasNext()) {
             Map.Entry<String, GpuTexture> entry = iterator.next();
             if (!retainedKeys.contains(entry.getKey())) {
-                entry.getValue().deleteGl();
+                detached.add(entry.getValue());
                 iterator.remove();
             }
         }
         registerDeck(activeDeck);
         registerDeck(replacementDeck);
+        new ReleasedClientState(false, new ArrayList<>(), detached).cleanupGl();
     }
 
     private void registerDeck(PageDeck<Bitmap> deck) {
@@ -1697,6 +1964,15 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
             } else {
                 resetGl();
             }
+            recycleBitmap();
+        }
+
+        void abandonClientResource() {
+            resetGl();
+            recycleBitmap();
+        }
+
+        private void recycleBitmap() {
             if (!bitmap.isRecycled()) {
                 bitmap.recycle();
             }

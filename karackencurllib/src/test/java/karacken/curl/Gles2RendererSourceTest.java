@@ -1,16 +1,63 @@
 package karacken.curl;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 import org.junit.Test;
 
 public class Gles2RendererSourceTest {
+    @Test
+    public void releaseCleanupFailureDropsIndependentReferencesAndCompletesTerminalOnce()
+            throws IOException {
+        AtomicReference<String> activeReference = new AtomicReference<>("active");
+        AtomicReference<String> replacementReference =
+                new AtomicReference<>("replacement");
+        AtomicInteger terminalCallbacks = new AtomicInteger();
+        AtomicInteger independentCleanup = new AtomicInteger();
+
+        Throwable failure = PageRendererReleaseTerminal.execute(
+                terminalCallbacks::incrementAndGet,
+                () -> {
+                    activeReference.set(null);
+                    throw new IllegalStateException("injected texture cleanup failure");
+                },
+                () -> {
+                    replacementReference.set(null);
+                    independentCleanup.incrementAndGet();
+                });
+
+        assertNotNull(failure);
+        assertEquals(IllegalStateException.class, failure.getClass());
+        assertNull(activeReference.get());
+        assertNull(replacementReference.get());
+        assertEquals(1, independentCleanup.get());
+        assertEquals(1, terminalCallbacks.get());
+        String rendererSource = source("PageRenderer.java");
+        String rendererRelease = methodBody(
+                rendererSource,
+                "void releaseDeck(long generationId, DeckReleaseReason reason)");
+        String rendererActivation = methodBody(
+                rendererSource,
+                "void activateDeck(long generationId)");
+        assertTrue(rendererRelease.contains("PageRendererReleaseTerminal.execute("));
+        assertTrue(rendererRelease.contains("events.onDeckReleased(generationId, reason)"));
+        assertFalse(rendererRelease.contains(
+                "if (!releasesActive && !releasesReplacement) {\n            return;"));
+        assertTrue(rendererActivation.contains("PageRendererReleaseTerminal.execute("));
+        assertTrue(rendererActivation.contains("releaseDeck(previous, DeckReleaseReason.REPLACED)"));
+        assertTrue(rendererActivation.contains("!retainSelected"));
+    }
+
     @Test
     public void rendererUsesShadersWithoutFixedFunctionCalls() throws IOException {
         String source = Files.readString(
@@ -123,6 +170,22 @@ public class Gles2RendererSourceTest {
         String draw = methodBody(
                 source,
                 "public void onDrawFrame(GL10 gl)");
+        String detach = methodBody(source, "public void detach()");
+        String visibility = methodBody(source, "public void setVisible(boolean visible)");
+        String cancelGesture = methodBody(source, "public void cancelGesture(long gestureId)");
+        String renderFailure = methodBody(
+                source,
+                "private void handleRenderFailure(RenderFailure failure)");
+        String surfaceDestroyed = methodBody(
+                source,
+                "public void surfaceDestroyed(SurfaceHolder holder)");
+        String releaseDeck = methodBody(
+                source,
+                "public PageSurfaceDeckReleaseResult releaseDeck(long generationId)");
+        String deckReleased = methodBody(
+                source,
+                "private void handleDeckReleased(");
+        String dispose = methodBody(source, "private void startDisposeIfNeeded()");
 
         assertTrue(source.contains("PresentedFrameRequest"));
         assertTrue(request.contains("queueEvent(() ->"));
@@ -132,7 +195,14 @@ public class Gles2RendererSourceTest {
                 < draw.indexOf("presentedFrameRequest.markRendered()"));
         assertTrue(draw.contains("postOnAnimation("));
         assertTrue(source.contains("cancelPresentedFrameRequest(long requestId)"));
-        assertTrue(source.contains("presentedFrameRequest.cancelAll()"));
+        assertTrue(detach.contains("presentedFrameRequest.cancelAll()"));
+        assertTrue(visibility.contains("presentedFrameRequest.cancelAll()"));
+        assertFalse(cancelGesture.contains("presentedFrameRequest.cancelAll()"));
+        assertTrue(renderFailure.contains("presentedFrameRequest.cancelAll()"));
+        assertTrue(surfaceDestroyed.contains("presentedFrameRequest.cancelAll()"));
+        assertTrue(releaseDeck.contains("presentedFrameRequest.cancelAll()"));
+        assertTrue(deckReleased.contains("presentedFrameRequest.cancelAll()"));
+        assertTrue(dispose.contains("presentedFrameRequest.cancelAll()"));
         assertTrue(source.contains("presentedFrameRequest.pendingCount()"));
     }
 
@@ -144,7 +214,7 @@ public class Gles2RendererSourceTest {
                 "private void completeSettlement(Settlement settlement, SettlementContext context)");
 
         int activation = settlement.indexOf(
-                "queueEvent(() -> renderer.activateDeck(promoted.getGenerationId()))");
+                "queuePromotion(promotion, promoted)");
         int render = settlement.indexOf("requestRender()");
         int completion = settlement.indexOf("onSettlementCompleted(");
         assertTrue(activation >= 0);
@@ -233,7 +303,13 @@ public class Gles2RendererSourceTest {
                 "private void handleDeckReleased");
         String releaseDeck = methodBody(
                 surfaceSource,
-                "public void releaseDeck(long generationId)");
+                "public PageSurfaceDeckReleaseResult releaseDeck(long generationId)");
+        String automaticRelease = methodBody(
+                surfaceSource,
+                "private boolean queueDeckRelease(");
+        String promotionRelease = methodBody(
+                surfaceSource,
+                "private boolean queuePromotion(");
         String startDispose = methodBody(
                 surfaceSource,
                 "private void startDisposeIfNeeded()");
@@ -287,11 +363,26 @@ public class Gles2RendererSourceTest {
         assertTrue(surfaceSource.contains(
                 "mainHandler.post(() -> handleDeckReleased(generationId, reason))"));
         assertTrue(releaseDeck.indexOf("cancelGesture()")
-                < releaseDeck.indexOf("deckCoordinator.release(generationId)"));
+                < releaseDeck.indexOf("releaseGate.request("));
+        assertTrue(releaseDeck.contains(
+                "result.getStatus() == PageSurfaceDeckReleaseResult.Status.ACCEPTED"));
+        assertTrue(releaseDeck.indexOf("releaseGate.request(")
+                < releaseDeck.indexOf("preparedGenerations.remove(generationId)"));
+        assertFalse(releaseDeck.contains("deckCoordinator.release(generationId)"));
+        assertTrue(deckReleased.indexOf("releaseGate.rendererDetached(generationId, reason)")
+                < deckReleased.indexOf("releaseGate.complete(generationId)"));
+        assertTrue(deckReleased.indexOf("releaseGate.complete(generationId)")
+                < deckReleased.indexOf("leaseRegistry.release("));
         assertTrue(deckReleased.indexOf("cancelGesture()")
-                < deckReleased.indexOf("deckCoordinator.release(generationId)"));
-        assertTrue(deckReleased.indexOf("leaseRegistry.markReleaseRequested(")
-                < deckReleased.indexOf("deckCoordinator.release(generationId)"));
+                < deckReleased.indexOf("releaseGate.rendererDetached(generationId, reason)"));
+        assertFalse(deckReleased.contains("leaseRegistry.markReleaseRequested("));
+        assertFalse(deckReleased.contains("deckCoordinator.release(generationId)"));
+        assertTrue(submission.contains("releaseGate.queueAutomatic("));
+        assertFalse(submission.contains("leaseRegistry.markReleaseRequested("));
+        assertTrue(automaticRelease.contains("releaseGate.queueAutomatic("));
+        assertTrue(promotionRelease.contains("releaseGate.queueAutomatic("));
+        assertTrue(startDispose.contains("releaseGate.acceptTerminal("));
+        assertTrue(startDispose.contains("releaseGate.close()"));
         assertTrue(surfaceSource.contains("holderSurfaceAvailable"));
         assertTrue(surfaceSource.contains("surfaceDestroyed(SurfaceHolder holder)"));
         assertTrue(surfaceSource.contains("PageSurfaceDisposalStage.SURFACE_RESUME"));
@@ -383,13 +474,13 @@ public class Gles2RendererSourceTest {
         assertTrue(submission.indexOf("renderer.releaseDeck(")
                 < submission.indexOf("renderer.prepareDeck(deck, activateWhenPrepared)"));
         assertTrue(submission.contains("submissionGate.rollbackAccepted(deck, gated)"));
-        assertTrue(submission.indexOf("leaseRegistry.markReleaseRequested(")
+        assertTrue(submission.indexOf("releaseGate.queueAutomatic(")
                 < submission.indexOf("onOwnershipTransferred.run()"));
         assertTrue(submission.indexOf("onOwnershipTransferred.run()")
                 < submission.indexOf("requestRender()"));
         assertTrue(surfaceSource.contains("onDeckSubmissionCapacityAvailable()"));
         assertTrue(deckReleased.indexOf("notifyDeckReleased(")
-                < deckReleased.indexOf("takeCapacityAvailableSignal(generationId)"));
+                < deckReleased.indexOf("notifyDeckSubmissionCapacityIfAvailable(generationId)"));
         assertTrue(surfaceSource.contains("getDeckLeaseLimit()"));
     }
 
@@ -403,11 +494,23 @@ public class Gles2RendererSourceTest {
         String detached = methodBody(
                 surfaceSource,
                 "protected void onDetachedFromWindow()");
+        String logicalDetach = methodBody(surfaceSource, "public void detach()");
+        String terminalRelease = methodBody(
+                surfaceSource,
+                "private void terminallyAbandonAcceptedRendererReleases()");
 
         assertTrue(surfaceDestroyed.indexOf("super.surfaceDestroyed(holder)")
+                < surfaceDestroyed.indexOf("terminallyAbandonAcceptedRendererReleases()"));
+        assertTrue(surfaceDestroyed.indexOf("super.surfaceDestroyed(holder)")
                 < surfaceDestroyed.indexOf("terminalDisposalGate.onSurfaceUnavailable"));
+        assertTrue(logicalDetach.indexOf("onPause()")
+                < logicalDetach.indexOf("terminallyAbandonAcceptedRendererReleases()"));
+        assertTrue(terminalRelease.contains("renderer::terminallyAbandonDeck"));
+        assertTrue(terminalRelease.indexOf("releaseGate.complete(generationId)")
+                < terminalRelease.indexOf("leaseRegistry.release("));
         assertTrue(detached.indexOf("super.onDetachedFromWindow()")
                 < detached.indexOf("terminalDisposalGate.onSurfaceUnavailable"));
+        assertTrue(surfaceSource.contains("onRendererAvailabilityRestored()"));
     }
 
     @Test

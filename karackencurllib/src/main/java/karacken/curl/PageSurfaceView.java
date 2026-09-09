@@ -42,7 +42,8 @@ public class PageSurfaceView extends GLSurfaceView {
     private static final int REQUIRED_DISPOSAL_CALLBACK_LIMIT = 1;
     private static final int AUXILIARY_DISPOSAL_CALLBACK_LIMIT = 2;
     private static final int OWNERSHIP_CALLBACK_LIMIT = 4;
-    private static final int PRESENTED_FRAME_CALLBACK_LIMIT = 1;
+    private static final int PRESENTED_FRAME_CALLBACK_LIMIT =
+            PresentedFrameRequest.MAX_PENDING_CALLBACKS;
     private static final int PAGE_OVERLAY_UPDATE_LIMIT = 1;
     private static final int MAIN_TERMINAL_ACTION_LIMIT =
             OWNERSHIP_CALLBACK_LIMIT + REQUIRED_DISPOSAL_CALLBACK_LIMIT;
@@ -116,12 +117,24 @@ public class PageSurfaceView extends GLSurfaceView {
             new DeckLeaseRegistry(this::advanceOwnershipEpoch);
     private final PageSurfaceDeckSubmissionGate<Bitmap> submissionGate =
             new PageSurfaceDeckSubmissionGate<>(deckCoordinator, leaseRegistry);
+    private final PageSurfaceDeckReleaseGate<Bitmap> releaseGate =
+            new PageSurfaceDeckReleaseGate<>(deckCoordinator, leaseRegistry);
     private final BoundaryRestorationProtocol boundaryRestorationProtocol =
             new BoundaryRestorationProtocol();
     private final PresentedFrameRequest presentedFrameRequest =
             new PresentedFrameRequest();
     private final Set<Long> preparedGenerations = new LinkedHashSet<>();
     private final PageRenderer renderer;
+    private long selectedFrameGeneration = NO_GENERATION_ID;
+    private volatile NativeFrameRequest nativeFrameRequest;
+
+    private static final class NativeFrameRequest {
+        final long generationId;
+        long requestId;
+        boolean cancelled;
+        NativeFrameRequest(long generationId) { this.generationId = generationId; }
+    }
+
     private final int touchSlop;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final AtomicInteger pendingMainTerminalActions = new AtomicInteger();
@@ -336,12 +349,12 @@ public class PageSurfaceView extends GLSurfaceView {
                 if (!frameRendered) {
                     return;
                 }
-                long presentedRequestId = presentedFrameRequest.markRendered();
-                if (presentedRequestId != NO_PRESENTED_FRAME_REQUEST_ID) {
+                long presentedCompletionId = presentedFrameRequest.markRendered();
+                if (presentedCompletionId != NO_PRESENTED_FRAME_REQUEST_ID) {
                     boolean posted = post(() -> postOnAnimation(
-                            () -> handlePresentedFrame(presentedRequestId)));
+                            () -> handlePresentedFrame(presentedCompletionId)));
                     if (!posted) {
-                        presentedFrameRequest.cancel(presentedRequestId);
+                        presentedFrameRequest.complete(presentedCompletionId);
                     }
                 }
                 long frameToken = boundaryRestorationProtocol.armedToken();
@@ -367,6 +380,7 @@ public class PageSurfaceView extends GLSurfaceView {
         attached = true;
         advanceOwnershipEpoch();
         onResume();
+        pageSurfaceListener.onRendererAvailabilityRestored();
         requestRender();
         scheduleOwnershipRetryEdge();
     }
@@ -382,11 +396,14 @@ public class PageSurfaceView extends GLSurfaceView {
         if (!disposeStarted) {
             failLiveOwnershipRequests();
         }
+        cancelNativeFrameRequest();
+        presentedFrameRequest.cancelAll();
         cancelGesture();
         queueDeckRelease(deckCoordinator.releasePending(
                 DeckReleaseReason.SESSION_DETACHED));
         requestRender();
         onPause();
+        terminallyAbandonAcceptedRendererReleases();
     }
 
     /**
@@ -458,16 +475,22 @@ public class PageSurfaceView extends GLSurfaceView {
         }
         boolean activateWhenPrepared =
                 offer.getPlacement() == PageDeckCoordinator.Placement.ACTIVE;
+        NativeFrameRequest candidate = nativeFrameRequest;
+        if (candidate != null && candidate.generationId != deck.getGenerationId()) {
+            cancelNativeFrameRequest();
+        }
         try {
-            queueEvent(() -> {
-                for (PageDeckCoordinator.Release<Bitmap> release :
-                        offer.getReleases()) {
-                    renderer.releaseDeck(
-                            release.getDeck().getGenerationId(),
-                            release.getReason());
-                }
-                renderer.prepareDeck(deck, activateWhenPrepared);
-            });
+            releaseGate.queueAutomatic(
+                    offer.getReleases(),
+                    () -> queueEvent(() -> {
+                        for (PageDeckCoordinator.Release<Bitmap> release :
+                                offer.getReleases()) {
+                            renderer.releaseDeck(
+                                    release.getDeck().getGenerationId(),
+                                    release.getReason());
+                        }
+                        renderer.prepareDeck(deck, activateWhenPrepared);
+                    }));
         } catch (RuntimeException | Error queueFailure) {
             try {
                 submissionGate.rollbackAccepted(deck, gated);
@@ -484,9 +507,6 @@ public class PageSurfaceView extends GLSurfaceView {
             if (preparedGenerations.remove(releasedGenerationId)) {
                 advanceOwnershipEpoch();
             }
-            leaseRegistry.markReleaseRequested(
-                    releasedGenerationId,
-                    release.getReason());
         }
         if (preparedGenerations.remove(deck.getGenerationId())) {
             advanceOwnershipEpoch();
@@ -635,6 +655,7 @@ public class PageSurfaceView extends GLSurfaceView {
         requireMainThread();
         surfaceVisible = visible;
         if (!visible) {
+            cancelNativeFrameRequest();
             presentedFrameRequest.cancelAll();
             cancelGesture();
         } else {
@@ -643,11 +664,12 @@ public class PageSurfaceView extends GLSurfaceView {
     }
 
     /**
-     * Arms a one-shot callback for the next complete frame rendered after this request.
+     * Registers one logical consumer for the next complete frame rendered after this request.
      *
      * <p>The callback runs on the Android main thread after the following animation pulse, so a
-     * hidden surface can update its buffer before the client reveals it. At most one request may
-     * be pending. The returned identifier can be cancelled when the associated gesture ends.
+     * hidden surface can update its buffer before the client reveals it. Up to the bounded set of
+     * production consumers share one physical next-frame request; each returned identifier can be
+     * cancelled independently.
      */
     public long requestNextPresentedFrame(Runnable callback) {
         requireMainThread();
@@ -669,10 +691,95 @@ public class PageSurfaceView extends GLSurfaceView {
         return requestId;
     }
 
+    /** Projects the client's existing presentation authority; it does not select a new frame. */
+    public void setSelectedFrameGeneration(long generationId) {
+        requireMainThread();
+        if (disposed || selectedFrameGeneration == generationId) return;
+        long previous = selectedFrameGeneration;
+        selectedFrameGeneration = generationId;
+        try {
+            queueEvent(() -> renderer.setSelectedFrameGeneration(generationId));
+        } catch (RuntimeException | Error failure) {
+            selectedFrameGeneration = previous;
+            throw failure;
+        }
+        requestRender();
+    }
+
+    /** Stages are drawable only at this native publisher's authorized candidate boundary. */
+    public long requestNativePagePresentedFrame(long generationId, Runnable callback) {
+        requireMainThread();
+        Objects.requireNonNull(callback, "callback");
+        if (disposed || !attached || !surfaceVisible
+                || activeGenerationId() != generationId
+                || !preparedGenerations.contains(generationId)) {
+            return NO_PRESENTED_FRAME_REQUEST_ID;
+        }
+        cancelNativeFrameRequest();
+        NativeFrameRequest request = new NativeFrameRequest(generationId);
+        request.requestId = presentedFrameRequest.request(() -> {
+            try {
+                callback.run();
+            } finally {
+                if (nativeFrameRequest == request) cancelNativeFrameRequest();
+            }
+        });
+        if (request.requestId == NO_PRESENTED_FRAME_REQUEST_ID) return request.requestId;
+        nativeFrameRequest = request;
+        try {
+            queueEvent(() -> {
+                synchronized (request) {
+                    if (request.cancelled || nativeFrameRequest != request) return;
+                    renderer.activateDeck(generationId);
+                    if (!renderer.hasActiveFrame(generationId)) {
+                        presentedFrameRequest.cancel(request.requestId);
+                        return;
+                    }
+                    // arm's Boolean identifies the first shared waiter, not admission.
+                    presentedFrameRequest.arm(request.requestId);
+                    requestRender();
+                }
+            });
+        } catch (RuntimeException | Error failure) {
+            synchronized (request) { request.cancelled = true; }
+            nativeFrameRequest = null;
+            presentedFrameRequest.cancel(request.requestId);
+            throw failure;
+        }
+        return request.requestId;
+    }
+
+    private void cancelNativeFrameRequest() {
+        NativeFrameRequest request = nativeFrameRequest;
+        if (request == null) return;
+        synchronized (request) {
+            request.cancelled = true;
+            nativeFrameRequest = null;
+            presentedFrameRequest.cancel(request.requestId);
+        }
+        try {
+            queueEvent(() -> {
+                // A newer candidate owns its boundary; obsolete cancellation cannot undo it.
+                if (nativeFrameRequest == null && renderer.restoreSelectedFrame(request.generationId)) {
+                    requestRender();
+                }
+            });
+        } catch (RuntimeException | Error unavailableQueue) {
+            if (!disposeStarted) {
+                handleRenderFailure(new RenderFailure(request.generationId, true,
+                        RenderFailureReason.CONTEXT, "Native frame rollback queue is unavailable",
+                        unavailableQueue));
+            }
+        }
+    }
+
     /** Cancels an outstanding frame-presentation callback without invoking it. */
     public boolean cancelPresentedFrameRequest(long requestId) {
         requireMainThread();
-        return presentedFrameRequest.cancel(requestId);
+        boolean cancelled = presentedFrameRequest.cancel(requestId);
+        NativeFrameRequest nativeRequest = nativeFrameRequest;
+        if (nativeRequest != null && nativeRequest.requestId == requestId) cancelNativeFrameRequest();
+        return cancelled;
     }
 
     /** Sets the logical reading direction used by future gestures and turns. */
@@ -694,7 +801,6 @@ public class PageSurfaceView extends GLSurfaceView {
     /** Cancels the identified gesture or settlement without navigating. */
     public void cancelGesture(long gestureId) {
         requireMainThread();
-        presentedFrameRequest.cancelAll();
         SettlementContext cancelledSettlement = cancelSettlementAnimator();
         long cancelledGestureId = activeGestureId != NO_GESTURE_ID
                 ? activeGestureId
@@ -773,26 +879,39 @@ public class PageSurfaceView extends GLSurfaceView {
         if (activated == null) {
             return;
         }
-        markPromotionRelease(promotion);
-        queueEvent(() -> renderer.activateDeck(activated.getGenerationId()));
+        if (!queuePromotion(promotion, activated)) {
+            return;
+        }
         requestRender();
     }
 
-    /** Releases a retained active or replacement deck and its GL textures. */
-    public void releaseDeck(long generationId) {
+    /**
+     * Releases a retained active or replacement deck and its GL textures.
+     *
+     * <p>Only {@link PageSurfaceDeckReleaseResult.Status#ACCEPTED} transfers a fresh release
+     * command to the renderer. A rejected queue submission restores coordinator and lease state
+     * before this method returns.
+     */
+    public PageSurfaceDeckReleaseResult releaseDeck(long generationId) {
         requireMainThread();
         PageDeck<Bitmap> activeDeck = deckCoordinator.getActiveDeck();
         if (activeDeck != null
                 && activeDeck.getGenerationId() == generationId) {
+            cancelNativeFrameRequest();
+            presentedFrameRequest.cancelAll();
             cancelGesture();
         }
-        if (preparedGenerations.remove(generationId)) {
-            advanceOwnershipEpoch();
+        PageSurfaceDeckReleaseResult result = releaseGate.request(
+                generationId,
+                (releasedGenerationId, reason) -> queueEvent(
+                        () -> renderer.releaseDeck(releasedGenerationId, reason)));
+        if (result.getStatus() == PageSurfaceDeckReleaseResult.Status.ACCEPTED) {
+            if (preparedGenerations.remove(generationId)) {
+                advanceOwnershipEpoch();
+            }
+            requestRender();
         }
-        PageDeckCoordinator.Release<Bitmap> release =
-                deckCoordinator.release(generationId);
-        queueDeckRelease(release);
-        requestRender();
+        return result;
     }
 
     /** Idempotently releases renderer, gesture, and deck state. */
@@ -964,6 +1083,7 @@ public class PageSurfaceView extends GLSurfaceView {
         if (disposedResult != null || disposeStarted) {
             return;
         }
+        cancelNativeFrameRequest();
         presentedFrameRequest.cancelAll();
         ownershipCallbackCapacityListener = null;
         ownershipSnapshotCoordinator.clearCapacityAvailableListener(
@@ -989,6 +1109,11 @@ public class PageSurfaceView extends GLSurfaceView {
         }
         try {
             submissionGate.close();
+        } catch (Throwable setupFailure) {
+            recordSetupFailure(setupFailure);
+        }
+        try {
+            releaseGate.close();
         } catch (Throwable setupFailure) {
             recordSetupFailure(setupFailure);
         }
@@ -1024,16 +1149,9 @@ public class PageSurfaceView extends GLSurfaceView {
             recordSetupFailure(setupFailure);
         }
         try {
-            for (PageDeckCoordinator.Release<Bitmap> release :
-                    deckCoordinator.dispose()) {
-                try {
-                    leaseRegistry.markReleaseRequested(
-                            release.getDeck().getGenerationId(),
-                            DeckReleaseReason.DISPOSED);
-                } catch (Throwable setupFailure) {
-                    recordSetupFailure(setupFailure);
-                }
-            }
+            List<PageDeckCoordinator.Release<Bitmap>> terminalReleases =
+                    deckCoordinator.dispose();
+            releaseGate.acceptTerminal(terminalReleases);
         } catch (Throwable setupFailure) {
             recordSetupFailure(setupFailure);
         }
@@ -1353,6 +1471,7 @@ public class PageSurfaceView extends GLSurfaceView {
         if (glPaused) {
             try {
                 renderer.abandonClientState();
+                terminallyAbandonAcceptedRendererReleases();
                 textures = renderer.textureCount();
                 clientOwnershipReleased = true;
             } catch (Throwable abandonFailure) {
@@ -1408,6 +1527,7 @@ public class PageSurfaceView extends GLSurfaceView {
             return;
         }
         if (releaseDeckLeases) {
+            terminallyAbandonAcceptedRendererReleases();
             for (DeckLeaseRegistry.Lease lease :
                     leaseRegistry.releaseAll(DeckReleaseReason.DISPOSED)) {
                 notifyDeckReleased(
@@ -1422,7 +1542,7 @@ public class PageSurfaceView extends GLSurfaceView {
                         ? 0
                         : leaseCount(disposingPendingGenerationId);
         int releaseInFlightDeckLeases =
-                leaseRegistry.releaseInFlightCount(
+                releaseGate.releaseInFlightCount(
                         disposingActiveGenerationId,
                         disposingPendingGenerationId);
         int orphanDeckLeases = leaseRegistry.size()
@@ -1490,7 +1610,7 @@ public class PageSurfaceView extends GLSurfaceView {
         int pendingDeckLeases = activeGenerationId == pendingGenerationId
                 ? 0
                 : leaseCount(pendingGenerationId);
-        int releaseInFlightDeckLeases = leaseRegistry.releaseInFlightCount(
+        int releaseInFlightDeckLeases = releaseGate.releaseInFlightCount(
                 activeGenerationId,
                 pendingGenerationId);
         int orphanDeckLeases = leaseRegistry.size()
@@ -1882,6 +2002,8 @@ public class PageSurfaceView extends GLSurfaceView {
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
         super.surfaceDestroyed(holder);
+        terminallyAbandonAcceptedRendererReleases();
+        cancelNativeFrameRequest();
         presentedFrameRequest.cancelAll();
         abandonPendingPageOverlayUpdate();
         renderer.invalidatePageOverlays();
@@ -1958,6 +2080,8 @@ public class PageSurfaceView extends GLSurfaceView {
         if (disposed) {
             return;
         }
+        cancelNativeFrameRequest();
+        presentedFrameRequest.cancelAll();
         long generationId = failure.getGenerationId();
         PageSurfaceListener owner = generationId < 0
                 ? pageSurfaceListener
@@ -1974,38 +2098,72 @@ public class PageSurfaceView extends GLSurfaceView {
         renderCapabilities = capabilities;
         advanceOwnershipEpoch();
         pageSurfaceListener.onCapabilitiesAvailable(capabilities);
+        pageSurfaceListener.onRendererAvailabilityRestored();
     }
 
     private void handleDeckReleased(
             long generationId,
             DeckReleaseReason reason) {
-        if (preparedGenerations.remove(generationId)) {
-            advanceOwnershipEpoch();
-        }
-        leaseRegistry.markReleaseRequested(generationId, reason);
         PageDeck<Bitmap> activeDeck = deckCoordinator.getActiveDeck();
         if (activeDeck != null
                 && activeDeck.getGenerationId() == generationId) {
+            cancelNativeFrameRequest();
+            presentedFrameRequest.cancelAll();
             cancelGesture();
         }
-        deckCoordinator.release(generationId);
-        DeckLeaseRegistry.Lease lease =
-                leaseRegistry.release(generationId);
+        if (!releaseGate.rendererDetached(generationId, reason)) {
+            return;
+        }
+        if (preparedGenerations.remove(generationId)) {
+            advanceOwnershipEpoch();
+        }
+        DeckReleaseReason effectiveReason = releaseGate.releaseReason(generationId);
+        if (!releaseGate.complete(generationId)) {
+            return;
+        }
+        DeckLeaseRegistry.Lease lease = leaseRegistry.release(
+                generationId,
+                effectiveReason == null ? reason : effectiveReason);
         if (lease == null) {
             return;
         }
-        DeckReleaseReason effectiveReason =
-                lease.getReleaseReason() == null
-                        ? reason
-                        : lease.getReleaseReason();
         notifyDeckReleased(
                 lease.getListener(),
                 generationId,
-                effectiveReason);
-        boolean capacityAvailable =
-                submissionGate.takeCapacityAvailableSignal(generationId);
-        if (capacityAvailable) {
+                lease.getReleaseReason());
+        notifyDeckSubmissionCapacityIfAvailable(generationId);
+    }
+
+    private void notifyDeckSubmissionCapacityIfAvailable(long generationId) {
+        if (submissionGate.takeCapacityAvailableSignal(generationId)) {
             notifyDeckSubmissionCapacityAvailable(pageSurfaceListener);
+        }
+    }
+
+    private void terminallyAbandonAcceptedRendererReleases() {
+        for (PageSurfaceGenerationReleaseRecord<Bitmap> record :
+                releaseGate.terminallyAbandonAccepted(
+                        generationId -> !disposeStarted && generationId == selectedFrameGeneration
+                                && renderer.retainsValidFrame(generationId, this::handleRenderFailure),
+                        renderer::terminallyAbandonDeck)) {
+            long generationId = record.getGenerationId();
+            if (preparedGenerations.remove(generationId)) {
+                advanceOwnershipEpoch();
+            }
+            if (!releaseGate.complete(generationId)) {
+                continue;
+            }
+            DeckLeaseRegistry.Lease lease = leaseRegistry.release(
+                    generationId,
+                    record.getReason());
+            if (lease == null) {
+                continue;
+            }
+            notifyDeckReleased(
+                    lease.getListener(),
+                    generationId,
+                    lease.getReleaseReason());
+            notifyDeckSubmissionCapacityIfAvailable(generationId);
         }
     }
 
@@ -2203,8 +2361,8 @@ public class PageSurfaceView extends GLSurfaceView {
         });
     }
 
-    private void handlePresentedFrame(long requestId) {
-        Runnable callback = presentedFrameRequest.complete(requestId);
+    private void handlePresentedFrame(long completionId) {
+        Runnable callback = presentedFrameRequest.complete(completionId);
         if (callback == null) {
             return;
         }
@@ -2261,10 +2419,11 @@ public class PageSurfaceView extends GLSurfaceView {
         PageDeckCoordinator.Promotion<Bitmap> promotion =
                 deckCoordinator.completeSettlement();
         PageDeck<Bitmap> promoted = promotion.getActivatedDeck();
-        if (promoted != null) {
-            markPromotionRelease(promotion);
-            queueEvent(() -> renderer.activateDeck(promoted.getGenerationId()));
-        } else if (settlement.getPageChange() != PageChange.NONE) {
+        if (promoted != null && !queuePromotion(promotion, promoted)) {
+            deckCoordinator.cancelSettlement();
+            return;
+        } else if (promoted == null
+                && settlement.getPageChange() != PageChange.NONE) {
             preparedGenerations.remove(context.generationId);
         }
         requestRender();
@@ -2322,26 +2481,54 @@ public class PageSurfaceView extends GLSurfaceView {
         }
     }
 
-    private void queueDeckRelease(PageDeckCoordinator.Release<Bitmap> release) {
+    private boolean queueDeckRelease(PageDeckCoordinator.Release<Bitmap> release) {
         if (release == null) {
-            return;
+            return true;
         }
         long generationId = release.getDeck().getGenerationId();
+        try {
+            releaseGate.queueAutomatic(
+                    java.util.Collections.singletonList(release),
+                    () -> queueEvent(
+                            () -> renderer.releaseDeck(
+                                    generationId,
+                                    release.getReason())));
+        } catch (RuntimeException | Error queueFailure) {
+            if (!deckCoordinator.rollbackRelease(release)) {
+                throw new IllegalStateException(
+                        "Rejected automatic release could not restore coordinator ownership",
+                        queueFailure);
+            }
+            return false;
+        }
         if (preparedGenerations.remove(generationId)) {
             advanceOwnershipEpoch();
         }
-        leaseRegistry.markReleaseRequested(generationId, release.getReason());
-        queueEvent(() -> renderer.releaseDeck(generationId, release.getReason()));
+        return true;
     }
 
-    private void markPromotionRelease(
-            PageDeckCoordinator.Promotion<Bitmap> promotion) {
+    private boolean queuePromotion(
+            PageDeckCoordinator.Promotion<Bitmap> promotion,
+            PageDeck<Bitmap> activated) {
         PageDeckCoordinator.Release<Bitmap> release = promotion.getRelease();
-        if (release != null) {
-            leaseRegistry.markReleaseRequested(
-                    release.getDeck().getGenerationId(),
-                    release.getReason());
+        List<PageDeckCoordinator.Release<Bitmap>> releases = release == null
+                ? java.util.Collections.emptyList()
+                : java.util.Collections.singletonList(release);
+        try {
+            releaseGate.queueAutomatic(
+                    releases,
+                    () -> queueEvent(
+                            () -> renderer.activateDeck(
+                                    activated.getGenerationId())));
+        } catch (RuntimeException | Error queueFailure) {
+            if (!deckCoordinator.rollbackPromotion(promotion)) {
+                throw new IllegalStateException(
+                        "Rejected promotion could not restore coordinator ownership",
+                        queueFailure);
+            }
+            return false;
         }
+        return true;
     }
 
     private float currentPagePercent() {

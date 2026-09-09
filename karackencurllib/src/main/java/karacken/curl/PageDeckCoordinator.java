@@ -22,10 +22,33 @@ final class PageDeckCoordinator<T> {
     static final class Release<T> {
         private final PageDeck<T> deck;
         private final DeckReleaseReason reason;
+        private final Boolean releasedFromActive;
 
         Release(PageDeck<T> deck, DeckReleaseReason reason) {
+            this(deck, reason, null);
+        }
+
+        private Release(
+                PageDeck<T> deck,
+                DeckReleaseReason reason,
+                Boolean releasedFromActive) {
             this.deck = Objects.requireNonNull(deck, "deck");
             this.reason = Objects.requireNonNull(reason, "reason");
+            this.releasedFromActive = releasedFromActive;
+        }
+
+        static <T> Release<T> explicit(PageDeck<T> deck, boolean releasedFromActive) {
+            return rollbackable(
+                    deck,
+                    DeckReleaseReason.EXPLICIT,
+                    releasedFromActive);
+        }
+
+        static <T> Release<T> rollbackable(
+                PageDeck<T> deck,
+                DeckReleaseReason reason,
+                boolean releasedFromActive) {
+            return new Release<>(deck, reason, releasedFromActive);
         }
 
         PageDeck<T> getDeck() {
@@ -35,28 +58,58 @@ final class PageDeckCoordinator<T> {
         DeckReleaseReason getReason() {
             return reason;
         }
+
+        boolean canRollbackRelease() {
+            return releasedFromActive != null;
+        }
+
+        boolean wasReleasedFromActive() {
+            if (releasedFromActive == null) {
+                throw new IllegalStateException("Release was not an explicit rollback claim");
+            }
+            return releasedFromActive;
+        }
     }
 
     static final class Promotion<T> {
         private final PageDeck<T> activatedDeck;
         private final Release<T> release;
+        private final PageDeck<T> previousActiveDeck;
+        private final PageDeck<T> previousPendingDeck;
+        private final Boolean previousSettling;
 
-        private Promotion(PageDeck<T> activatedDeck, Release<T> release) {
+        private Promotion(
+                PageDeck<T> activatedDeck,
+                Release<T> release,
+                PageDeck<T> previousActiveDeck,
+                PageDeck<T> previousPendingDeck,
+                Boolean previousSettling) {
             this.activatedDeck = activatedDeck;
             this.release = release;
+            this.previousActiveDeck = previousActiveDeck;
+            this.previousPendingDeck = previousPendingDeck;
+            this.previousSettling = previousSettling;
         }
 
         static <T> Promotion<T> none() {
-            return new Promotion<>(null, null);
+            return new Promotion<>(null, null, null, null, null);
         }
 
         static <T> Promotion<T> activated(
                 PageDeck<T> deck,
-                PageDeck<T> releasedDeck) {
+                PageDeck<T> releasedDeck,
+                PageDeck<T> previousActiveDeck,
+                PageDeck<T> previousPendingDeck,
+                boolean previousSettling) {
             Release<T> release = releasedDeck == null
                     ? null
                     : new Release<>(releasedDeck, DeckReleaseReason.REPLACED);
-            return new Promotion<>(deck, release);
+            return new Promotion<>(
+                    deck,
+                    release,
+                    previousActiveDeck,
+                    previousPendingDeck,
+                    previousSettling);
         }
 
         PageDeck<T> getActivatedDeck() {
@@ -73,6 +126,10 @@ final class PageDeckCoordinator<T> {
 
         Release<T> getRelease() {
             return release;
+        }
+
+        boolean canRollback() {
+            return previousSettling != null;
         }
     }
 
@@ -283,12 +340,20 @@ final class PageDeckCoordinator<T> {
             if (!settling && pendingDeck == null) {
                 return Promotion.none();
             }
+            PageDeck<T> previousActiveDeck = activeDeck;
+            PageDeck<T> previousPendingDeck = pendingDeck;
+            boolean previousSettling = settling;
             settling = false;
             if (pendingDeck != null) {
                 PageDeck<T> released = activeDeck;
                 activeDeck = pendingDeck;
                 pendingDeck = null;
-                result = Promotion.activated(activeDeck, released);
+                result = Promotion.activated(
+                        activeDeck,
+                        released,
+                        previousActiveDeck,
+                        previousPendingDeck,
+                        previousSettling);
             } else {
                 result = Promotion.none();
             }
@@ -313,13 +378,41 @@ final class PageDeckCoordinator<T> {
             if (disposed || settling || pendingDeck == null) {
                 return Promotion.none();
             }
+            PageDeck<T> previousActiveDeck = activeDeck;
+            PageDeck<T> previousPendingDeck = pendingDeck;
+            boolean previousSettling = settling;
             PageDeck<T> released = activeDeck;
             activeDeck = pendingDeck;
             pendingDeck = null;
-            result = Promotion.activated(activeDeck, released);
+            result = Promotion.activated(
+                    activeDeck,
+                    released,
+                    previousActiveDeck,
+                    previousPendingDeck,
+                    previousSettling);
         }
         ownershipMutated.run();
         return result;
+    }
+
+    boolean rollbackPromotion(Promotion<T> promotion) {
+        Objects.requireNonNull(promotion, "promotion");
+        if (!promotion.canRollback()) {
+            return false;
+        }
+        synchronized (this) {
+            if (disposed
+                    || activeDeck != promotion.activatedDeck
+                    || pendingDeck != null
+                    || settling) {
+                return false;
+            }
+            activeDeck = promotion.previousActiveDeck;
+            pendingDeck = promotion.previousPendingDeck;
+            settling = promotion.previousSettling;
+        }
+        ownershipMutated.run();
+        return true;
     }
 
     synchronized PageDeck<T> getActiveDeck() {
@@ -340,18 +433,43 @@ final class PageDeckCoordinator<T> {
             if (activeDeck != null && activeDeck.getGenerationId() == generationId) {
                 PageDeck<T> released = activeDeck;
                 activeDeck = null;
-                result = new Release<>(released, DeckReleaseReason.EXPLICIT);
+                result = Release.explicit(released, true);
             } else if (pendingDeck != null
                     && pendingDeck.getGenerationId() == generationId) {
                 PageDeck<T> released = pendingDeck;
                 pendingDeck = null;
-                result = new Release<>(released, DeckReleaseReason.EXPLICIT);
+                result = Release.explicit(released, false);
             } else {
                 return null;
             }
         }
         ownershipMutated.run();
         return result;
+    }
+
+    boolean rollbackRelease(Release<T> release) {
+        Objects.requireNonNull(release, "release");
+        if (!release.canRollbackRelease()) {
+            return false;
+        }
+        synchronized (this) {
+            if (disposed) {
+                return false;
+            }
+            if (release.wasReleasedFromActive()) {
+                if (activeDeck != null) {
+                    return false;
+                }
+                activeDeck = release.getDeck();
+            } else {
+                if (pendingDeck != null) {
+                    return false;
+                }
+                pendingDeck = release.getDeck();
+            }
+        }
+        ownershipMutated.run();
+        return true;
     }
 
     Release<T> releasePending(DeckReleaseReason reason) {
@@ -363,7 +481,7 @@ final class PageDeckCoordinator<T> {
             }
             PageDeck<T> released = pendingDeck;
             pendingDeck = null;
-            result = new Release<>(released, reason);
+            result = Release.rollbackable(released, reason, false);
         }
         ownershipMutated.run();
         return result;
