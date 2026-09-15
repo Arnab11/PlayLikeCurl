@@ -20,7 +20,10 @@ import karacken.curl.LandscapePageDeck;
 import karacken.curl.DeckRejectionReason;
 import karacken.curl.PageChange;
 import karacken.curl.PageDeck;
+import karacken.curl.PageDisplayRect;
 import karacken.curl.PageImage;
+import karacken.curl.PageLeafRole;
+import karacken.curl.PageMaterial;
 import karacken.curl.PageSurfaceListener;
 import karacken.curl.PageSurfaceView;
 import karacken.curl.PortraitPageDeck;
@@ -30,6 +33,10 @@ import karacken.curl.RenderFailure;
 /** Standalone production-API demo using client-decoded page bitmaps. */
 public class MainActivity extends AppCompatActivity {
     private static final String TAG = "PlayLikeCurlDemo";
+    private static final int PAPER_FRONT_ARGB = 0xFFF5F2EA;
+    private static final int PAPER_REVERSE_ARGB = 0xFFE9E3D8;
+    private static final int BORDER_ARGB = 0xFF5B554C;
+    private static final int BACKGROUND_ARGB = 0xFFF5F2EA;
     private static final String[] PAGE_ASSETS = {
         "portrait/page1.png",
         "portrait/page2.png",
@@ -47,6 +54,8 @@ public class MainActivity extends AppCompatActivity {
     private boolean landscapeSpread;
     private boolean capabilitiesAvailable;
     private boolean initialDeckSubmitted;
+    private boolean hasPreparedDeck;
+    private Integer pendingTargetOrdinal;
     private int currentOrdinal;
     private long nextGenerationId = 1L;
 
@@ -72,6 +81,7 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public void onDeckPrepared(long generationId) {
                 Log.i(TAG, "deck prepared generation=" + generationId);
+                hasPreparedDeck = true;
             }
 
             @Override
@@ -84,8 +94,15 @@ public class MainActivity extends AppCompatActivity {
                                 + generationId
                                 + " reason="
                                 + reason);
-                if (reason == DeckRejectionReason.SESSION_DETACHED) {
-                    initialDeckSubmitted = false;
+                if (reason == DeckRejectionReason.SESSION_DETACHED
+                        || reason == DeckRejectionReason.CAPABILITIES_UNAVAILABLE
+                        || reason == DeckRejectionReason.INVALID_CONTENT
+                        || reason == DeckRejectionReason.RESOURCE_CAPACITY) {
+                    pendingTargetOrdinal = null;
+                    if (!hasPreparedDeck) {
+                        initialDeckSubmitted = false;
+                        pageSurfaceView.post(() -> submitInitialDeckIfReady());
+                    }
                 }
             }
 
@@ -102,6 +119,29 @@ public class MainActivity extends AppCompatActivity {
             }
 
             @Override
+            public void onSettlementStarted(
+                    long generationId,
+                    String sourceLogicalPageId,
+                    String targetLogicalPageId,
+                    PageChange pageChange) {
+                if (pageChange == PageChange.NONE || pages.isEmpty()) {
+                    return;
+                }
+                int target = predictTargetOrdinal(pageChange);
+                pendingTargetOrdinal = target;
+                PageDeck<Bitmap> pending = deckForOrdinal(target);
+                Log.i(
+                        TAG,
+                        "submitting pending deck generation="
+                                + pending.getGenerationId()
+                                + " targetOrdinal="
+                                + target
+                                + " pageChange="
+                                + pageChange);
+                pageSurfaceView.submitDeck(pending);
+            }
+
+            @Override
             public void onSettlementCompleted(
                     long generationId,
                     String currentLogicalPageId,
@@ -111,7 +151,26 @@ public class MainActivity extends AppCompatActivity {
                     return;
                 }
                 currentOrdinal = currentPageOrdinal;
-                pageSurfaceView.submitDeck(deckForCurrentOrdinal());
+                if (pendingTargetOrdinal != null
+                        && pendingTargetOrdinal == currentOrdinal) {
+                    Log.i(
+                            TAG,
+                            "pending deck covers ordinal="
+                                    + currentOrdinal
+                                    + "; awaiting promotion");
+                    pendingTargetOrdinal = null;
+                    return;
+                }
+                pendingTargetOrdinal = null;
+                Log.i(TAG, "submitting fallback deck ordinal=" + currentOrdinal);
+                pageSurfaceView.submitDeck(deckForOrdinal(currentOrdinal));
+            }
+
+            @Override
+            public void onSettlementCancelled(
+                    long generationId,
+                    String currentLogicalPageId) {
+                pendingTargetOrdinal = null;
             }
 
             @Override
@@ -135,6 +194,9 @@ public class MainActivity extends AppCompatActivity {
             }
         });
         setContentView(pageSurfaceView);
+        pageSurfaceView.addOnLayoutChangeListener(
+                (view, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom) ->
+                        submitInitialDeckIfReady());
         decodePages();
     }
 
@@ -230,8 +292,11 @@ public class MainActivity extends AppCompatActivity {
         if (!capabilitiesAvailable || pages.isEmpty() || initialDeckSubmitted) {
             return;
         }
+        if (pageSurfaceView.getWidth() <= 0 || pageSurfaceView.getHeight() <= 0) {
+            return;
+        }
         initialDeckSubmitted = true;
-        PageDeck<Bitmap> deck = deckForCurrentOrdinal();
+        PageDeck<Bitmap> deck = deckForOrdinal(currentOrdinal);
         Log.i(
                 TAG,
                 "submitting deck generation="
@@ -243,34 +308,80 @@ public class MainActivity extends AppCompatActivity {
         pageSurfaceView.submitDeck(deck);
     }
 
-    private PageDeck<Bitmap> deckForCurrentOrdinal() {
-        long generationId = nextGenerationId++;
+    private int predictTargetOrdinal(PageChange pageChange) {
+        int target;
         if (landscapeSpread) {
-            int currentLeft = Math.max(0, Math.min(even(currentOrdinal), pages.size() - 2));
-            return new LandscapePageDeck<>(
-                    page(generationId, currentLeft - 2),
-                    page(generationId, currentLeft - 1),
-                    page(generationId, currentLeft),
-                    page(generationId, currentLeft + 1),
-                    page(generationId, currentLeft + 2),
-                    page(generationId, currentLeft + 3));
+            if (pageChange == PageChange.NEXT) {
+                target = even(currentOrdinal) + 2;
+            } else {
+                target = even(currentOrdinal) - 2;
+            }
+        } else {
+            if (pageChange == PageChange.NEXT) {
+                target = currentOrdinal + 1;
+            } else {
+                target = currentOrdinal - 1;
+            }
         }
-        return new PortraitPageDeck<>(
-                page(generationId, currentOrdinal - 1),
-                page(generationId, currentOrdinal),
-                page(generationId, currentOrdinal + 1));
+        return Math.max(0, Math.min(target, pages.size() - 1));
     }
 
-    private PageImage<Bitmap> page(long generationId, int ordinal) {
+    private PageDeck<Bitmap> deckForOrdinal(int ordinal) {
+        long generationId = nextGenerationId++;
+        int surfaceWidth = Math.max(1, pageSurfaceView.getWidth());
+        int surfaceHeight = Math.max(1, pageSurfaceView.getHeight());
+        if (landscapeSpread) {
+            int split = Math.max(1, surfaceWidth / 2);
+            PageDisplayRect leftRect = new PageDisplayRect(0, 0, split, surfaceHeight);
+            PageDisplayRect rightRect =
+                    new PageDisplayRect(split, 0, surfaceWidth, surfaceHeight);
+            PageDisplayRect clipping =
+                    new PageDisplayRect(0, 0, surfaceWidth, surfaceHeight);
+            int currentLeft = Math.max(0, Math.min(even(ordinal), pages.size() - 2));
+            return new LandscapePageDeck<>(
+                    page(generationId, currentLeft - 2, leftRect, PageLeafRole.LEFT, clipping),
+                    page(generationId, currentLeft - 1, rightRect, PageLeafRole.RIGHT, clipping),
+                    page(generationId, currentLeft, leftRect, PageLeafRole.LEFT, clipping),
+                    page(generationId, currentLeft + 1, rightRect, PageLeafRole.RIGHT, clipping),
+                    page(generationId, currentLeft + 2, leftRect, PageLeafRole.LEFT, clipping),
+                    page(generationId, currentLeft + 3, rightRect, PageLeafRole.RIGHT, clipping));
+        }
+        PageDisplayRect display =
+                new PageDisplayRect(0, 0, surfaceWidth, surfaceHeight);
+        return new PortraitPageDeck<>(
+                page(generationId, ordinal - 1, display, PageLeafRole.FULL, display),
+                page(generationId, ordinal, display, PageLeafRole.FULL, display),
+                page(generationId, ordinal + 1, display, PageLeafRole.FULL, display));
+    }
+
+    private PageImage<Bitmap> page(
+            long generationId,
+            int ordinal,
+            PageDisplayRect displayRect,
+            PageLeafRole leafRole,
+            PageDisplayRect clippingRect) {
         int boundedOrdinal = Math.max(0, Math.min(ordinal, pages.size() - 1));
         Bitmap bitmap = pages.get(boundedOrdinal);
+        PageMaterial material = new PageMaterial(
+                generationId,
+                PAPER_FRONT_ARGB,
+                PAPER_REVERSE_ARGB,
+                BORDER_ARGB,
+                BACKGROUND_ARGB,
+                leafRole,
+                displayRect,
+                clippingRect,
+                null,
+                1);
         return new PageImage<>(
                 generationId,
                 PAGE_ASSETS[boundedOrdinal],
                 boundedOrdinal,
                 bitmap.getWidth(),
                 bitmap.getHeight(),
-                bitmap);
+                displayRect,
+                bitmap,
+                material);
     }
 
     private static int even(int value) {

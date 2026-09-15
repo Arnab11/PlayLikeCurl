@@ -2405,12 +2405,6 @@ public class PageSurfaceView extends GLSurfaceView {
     }
 
     private void completeSettlement(Settlement settlement, SettlementContext context) {
-        LandscapeSpreadModel spread = landscapeModelOrNull();
-        if (spread != null) {
-            spread.completeSettlement(settlement);
-        } else {
-            interactionModelOrNull().completeSettlement(settlement);
-        }
         settlementRunning = false;
         settlementAnimator = null;
         activeSettlementContext = null;
@@ -2421,10 +2415,15 @@ public class PageSurfaceView extends GLSurfaceView {
         PageDeck<Bitmap> promoted = promotion.getActivatedDeck();
         if (promoted != null && !queuePromotion(promotion, promoted)) {
             deckCoordinator.cancelSettlement();
+            completeInteractionSettlement(settlement);
             return;
-        } else if (promoted == null
-                && settlement.getPageChange() != PageChange.NONE) {
-            preparedGenerations.remove(context.generationId);
+        }
+        if (promoted == null) {
+            // No replacement was staged: advance the active interaction model in place.
+            completeInteractionSettlement(settlement);
+            if (settlement.getPageChange() != PageChange.NONE) {
+                preparedGenerations.remove(context.generationId);
+            }
         }
         requestRender();
 
@@ -2437,6 +2436,15 @@ public class PageSurfaceView extends GLSurfaceView {
         if (settlement.getPageChange() != PageChange.NONE
                 && onPageChangeListener != null) {
             onPageChangeListener.onPageChanged(context.targetOrdinal);
+        }
+    }
+
+    private void completeInteractionSettlement(Settlement settlement) {
+        LandscapeSpreadModel spread = landscapeModelOrNull();
+        if (spread != null) {
+            spread.completeSettlement(settlement);
+        } else {
+            interactionModelOrNull().completeSettlement(settlement);
         }
     }
 
