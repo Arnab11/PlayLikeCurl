@@ -146,13 +146,8 @@ public class Gles2RendererSourceTest {
         assertTrue(source.contains("getFrontPaperColorArgb()"));
         assertTrue(source.contains("getReversePaperColorArgb()"));
         assertTrue(source.contains("getFixedBorderColorArgb()"));
-        assertTrue(source.contains("uniform float uReverseMaterialMix"));
-        assertFalse(source.contains("gl_FrontFacing"));
         assertTrue(moving.contains(
                 "PageReverseMaterialMix.fromCurlPosition(state.getCurlPosition())"));
-        assertTrue(textures.contains(
-                "GLES20.glUniform1f(reverseMaterialMixUniform, reverseMaterialMix)"));
-        assertTrue(source.contains("mix(frontColor, uReversePaperColor, uReverseMaterialMix)"));
         int clip = page.indexOf("GLES20.glEnable(GLES20.GL_SCISSOR_TEST)");
         int draw = page.indexOf("GLES20.glDrawElements(");
         int unclip = page.indexOf("GLES20.glDisable(GLES20.GL_SCISSOR_TEST)");

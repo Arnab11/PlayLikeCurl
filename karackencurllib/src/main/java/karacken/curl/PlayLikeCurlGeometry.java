@@ -35,22 +35,57 @@ final class PlayLikeCurlGeometry {
     static void update(PageGeometry page, float curlPosition, boolean active) {
         int grid = PlayLikeCurlModel.GRID;
         float heightCorrection = (page.getBitmapRatio() - 1f) / 2f;
+        float R = PlayLikeCurlModel.RADIUS;
+        float xc = curlPosition / (float) grid;
+        
+        float alpha = (float) Math.toRadians(-15);
+        float cosA = (float) Math.cos(alpha);
+        float sinA = (float) Math.sin(alpha);
+        
         for (int row = 0; row <= grid; row++) {
             for (int column = 0; column <= grid; column++) {
                 int offset = 3 * (row * (grid + 1) + column);
-                float normalizedX = column / (float) grid;
-                if (page.getRole() == PageRole.FRONT) {
-                    page.getPositions()[offset] = frontX(column, curlPosition);
-                } else if (page.getRole() == PageRole.LEFT) {
-                    page.getPositions()[offset] = leftX(column, curlPosition);
-                } else {
-                    page.getPositions()[offset] = normalizedX;
+                float x = column / (float) grid;
+                float y = row / (float) grid * page.getBitmapRatio() - heightCorrection;
+                
+                if (page.getRole() == PageRole.RIGHT) {
+                    page.getPositions()[offset] = x;
+                    page.getPositions()[offset + 1] = y;
+                    page.getPositions()[offset + 2] = depth(page.getRole());
+                    continue;
                 }
-                page.getPositions()[offset + 1] =
-                        row / (float) grid * page.getBitmapRatio() - heightCorrection;
-                page.getPositions()[offset + 2] = active
-                        ? activeDepth(page.getRole(), column, curlPosition)
+                
+                float d = (x - xc) * cosA + y * sinA;
+                
+                if (d <= 0f) {
+                    page.getPositions()[offset] = x;
+                    page.getPositions()[offset + 1] = y;
+                    page.getPositions()[offset + 2] = active ? 
+                        (page.getRole() == PageRole.LEFT ? PlayLikeCurlModel.LEFT_DEPTH : PlayLikeCurlModel.FRONT_DEPTH) 
                         : depth(page.getRole());
+                } else {
+                    float theta = d / R;
+                    float dNew;
+                    float zNew;
+                    if (theta <= Math.PI) {
+                        dNew = (float) (R * Math.sin(theta));
+                        zNew = (float) (R - R * Math.cos(theta));
+                    } else {
+                        dNew = (float) -(d - Math.PI * R);
+                        zNew = 2f * R;
+                    }
+                    
+                    float dx = (dNew - d) * cosA;
+                    float dy = (dNew - d) * sinA;
+                    
+                    page.getPositions()[offset] = x + dx;
+                    page.getPositions()[offset + 1] = y + dy;
+                    
+                    float baseDepth = active ? 
+                        (page.getRole() == PageRole.LEFT ? PlayLikeCurlModel.LEFT_DEPTH : PlayLikeCurlModel.FRONT_DEPTH) 
+                        : depth(page.getRole());
+                    page.getPositions()[offset + 2] = baseDepth + zNew;
+                }
             }
         }
     }
@@ -126,29 +161,15 @@ final class PlayLikeCurlGeometry {
     }
 
     private static float frontX(int column, float curlPosition) {
-        float percentage = 1f - curlPosition / PlayLikeCurlModel.GRID;
-        float radius = resolvedRadius(percentage);
-        float movement = percentage > 0.05f ? percentage - 0.05f : 0f;
-        return column / (float) PlayLikeCurlModel.GRID * (1f - radius) - movement;
+        return curlPosition / (float) PlayLikeCurlModel.GRID;
     }
 
     private static float leftX(int column, float curlPosition) {
-        float percentage = (1f - curlPosition / PlayLikeCurlModel.GRID) * 0.75f;
-        float radius = resolvedRadius(percentage);
-        return column / (float) PlayLikeCurlModel.GRID * (1f - radius) - percentage;
+        return curlPosition / (float) PlayLikeCurlModel.GRID;
     }
 
     private static float activeDepth(PageRole role, int column, float curlPosition) {
-        if (role == PageRole.RIGHT) return PlayLikeCurlModel.RIGHT_DEPTH;
-        float rawPercentage = 1f - curlPosition / PlayLikeCurlModel.GRID;
-        float percentage = role == PageRole.LEFT ? rawPercentage * 0.75f : rawPercentage;
-        float radius = resolvedRadius(percentage);
-        float waveWidth = role == PageRole.LEFT ? 0.50f : 0.60f;
-        float delta = PlayLikeCurlModel.GRID - curlPosition;
-        return (float) (
-                radius * Math.sin(
-                        3.14f / (PlayLikeCurlModel.GRID * waveWidth) * (column - delta))
-                        + radius * 1.1f);
+        return role == PageRole.LEFT ? PlayLikeCurlModel.LEFT_DEPTH : PlayLikeCurlModel.FRONT_DEPTH;
     }
 
     private static float resolvedRadius(float percentage) {

@@ -63,7 +63,6 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
                     + "uniform float uIsFiller;\n"
                     + "uniform vec4 uFillerColor;\n"
                     + "uniform vec4 uReversePaperColor;\n"
-                    + "uniform float uReverseMaterialMix;\n"
                     + "varying vec2 vTextureCoordinate;\n"
                     + "void main() {\n"
                     + "  vec4 frontColor;\n"
@@ -74,7 +73,11 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
                     + "    vec4 overlay = texture2D(uOverlayTexture, vTextureCoordinate);\n"
                     + "    frontColor = mix(base, overlay + base * (1.0 - overlay.a), uHasOverlay);\n"
                     + "  }\n"
-                    + "  gl_FragColor = mix(frontColor, uReversePaperColor, uReverseMaterialMix);\n"
+                    + "  if (gl_FrontFacing) {\n"
+                    + "    gl_FragColor = frontColor;\n"
+                    + "  } else {\n"
+                    + "    gl_FragColor = uReversePaperColor;\n"
+                    + "  }\n"
                     + "}\n";
 
     private static final String SHADOW_VERTEX_SHADER =
@@ -165,7 +168,7 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
     private int isFillerUniform;
     private int fillerColorUniform;
     private int reversePaperColorUniform;
-    private int reverseMaterialMixUniform;
+
     private int shadowProgram;
     private int shadowPositionAttribute;
     private int shadowGradientAttribute;
@@ -879,12 +882,9 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
             fillerColorUniform = GLES20.glGetUniformLocation(program, "uFillerColor");
             reversePaperColorUniform =
                     GLES20.glGetUniformLocation(program, "uReversePaperColor");
-            reverseMaterialMixUniform =
-                    GLES20.glGetUniformLocation(program, "uReverseMaterialMix");
             if (isFillerUniform < 0
                     || fillerColorUniform < 0
-                    || reversePaperColorUniform < 0
-                    || reverseMaterialMixUniform < 0) {
+                    || reversePaperColorUniform < 0) {
                 throw new IllegalStateException("Page material shader uniforms are unavailable");
             }
             shadowProgram = createProgram(SHADOW_VERTEX_SHADER, SHADOW_FRAGMENT_SHADER);
@@ -1784,6 +1784,9 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
         }
         GLES20.glEnable(GLES20.GL_SCISSOR_TEST);
         GLES20.glFrontFace(mesh.horizontallyMirrored ? GLES20.GL_CW : GLES20.GL_CCW);
+        if (active) {
+            GLES20.glDepthFunc(GLES20.GL_ALWAYS);
+        }
         try {
             GLES20.glScissor(
                     clip.getLeftPx(),
@@ -1791,7 +1794,7 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
                     clip.getWidthPx(),
                     clip.getHeightPx());
             GLES20.glUniformMatrix4fv(matrixUniform, 1, false, mvpMatrix, 0);
-            drawPageTextures(resource, baseTexture, overlayTexture, reverseMaterialMix);
+            drawPageTextures(resource, baseTexture, overlayTexture);
             GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, mesh.positionBufferId);
             GLES20.glEnableVertexAttribArray(positionAttribute);
             GLES20.glVertexAttribPointer(positionAttribute, 3, GLES20.GL_FLOAT, false, 0, 0);
@@ -1809,6 +1812,9 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
             GLES20.glDisableVertexAttribArray(textureCoordinateAttribute);
             return true;
         } finally {
+            if (active) {
+                GLES20.glDepthFunc(GLES20.GL_LEQUAL);
+            }
             GLES20.glFrontFace(GLES20.GL_CCW);
             GLES20.glDisable(GLES20.GL_SCISSOR_TEST);
         }
@@ -1817,8 +1823,7 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
     private void drawPageTextures(
             PageImage<Bitmap> resource,
             GpuTexture baseTexture,
-            GpuTexture overlayTexture,
-            float reverseMaterialMix) {
+            GpuTexture overlayTexture) {
         int reverseColor = resource.getMaterial().getReversePaperColorArgb();
         GLES20.glUniform4f(
                 reversePaperColorUniform,
@@ -1826,7 +1831,6 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
                 colorChannel(reverseColor, 8),
                 colorChannel(reverseColor, 0),
                 colorChannel(reverseColor, 24));
-        GLES20.glUniform1f(reverseMaterialMixUniform, reverseMaterialMix);
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
         GLES20.glBindTexture(
                 GLES20.GL_TEXTURE_2D,
