@@ -338,20 +338,28 @@ public class MainActivity extends AppCompatActivity {
             PageDisplayRect clipping =
                     new PageDisplayRect(0, 0, surfaceWidth, surfaceHeight);
             int currentLeft = Math.max(0, Math.min(even(ordinal), pages.size() - 2));
+            boolean previousAvailable = currentLeft > 0;
+            boolean nextAvailable = currentLeft + 2 < pages.size();
             return new LandscapePageDeck<>(
                     page(generationId, currentLeft - 2, leftRect, PageLeafRole.LEFT, clipping),
                     page(generationId, currentLeft - 1, rightRect, PageLeafRole.RIGHT, clipping),
                     page(generationId, currentLeft, leftRect, PageLeafRole.LEFT, clipping),
                     page(generationId, currentLeft + 1, rightRect, PageLeafRole.RIGHT, clipping),
                     page(generationId, currentLeft + 2, leftRect, PageLeafRole.LEFT, clipping),
-                    page(generationId, currentLeft + 3, rightRect, PageLeafRole.RIGHT, clipping));
+                    page(generationId, currentLeft + 3, rightRect, PageLeafRole.RIGHT, clipping),
+                    previousAvailable,
+                    nextAvailable);
         }
         PageDisplayRect display =
                 new PageDisplayRect(0, 0, surfaceWidth, surfaceHeight);
+        boolean previousAvailable = ordinal > 0;
+        boolean nextAvailable = ordinal < pages.size() - 1;
         return new PortraitPageDeck<>(
                 page(generationId, ordinal - 1, display, PageLeafRole.FULL, display),
                 page(generationId, ordinal, display, PageLeafRole.FULL, display),
-                page(generationId, ordinal + 1, display, PageLeafRole.FULL, display));
+                page(generationId, ordinal + 1, display, PageLeafRole.FULL, display),
+                previousAvailable,
+                nextAvailable);
     }
 
     private PageImage<Bitmap> page(

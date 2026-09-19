@@ -999,7 +999,11 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
             portraitLeftResource = portrait.getPrevious();
             portraitFrontResource = portrait.getCurrent();
             portraitRightResource = portrait.getNext();
-            portraitModel = new PlayLikeCurlModel(3, 1);
+            int pageCount = 1
+                    + (portrait.canTurn(PageChange.PREVIOUS) ? 1 : 0)
+                    + (portrait.canTurn(PageChange.NEXT) ? 1 : 0);
+            int initialPosition = portrait.canTurn(PageChange.PREVIOUS) ? 1 : 0;
+            portraitModel = new PlayLikeCurlModel(pageCount, initialPosition);
             landscapeSpreadModel = null;
             clearSpreadResources();
         } else if (deck instanceof LandscapePageDeck) {
@@ -1010,7 +1014,11 @@ public final class PageRenderer implements GLSurfaceView.Renderer {
             spreadCurrentRightResource = spread.getCurrentRight();
             spreadNextLeftResource = spread.getNextLeft();
             spreadNextRightResource = spread.getNextRight();
-            landscapeSpreadModel = new LandscapeSpreadModel(6, 2);
+            int spreadCount = 1
+                    + (spread.canTurn(PageChange.PREVIOUS) ? 1 : 0)
+                    + (spread.canTurn(PageChange.NEXT) ? 1 : 0);
+            int initialSpread = spread.canTurn(PageChange.PREVIOUS) ? 1 : 0;
+            landscapeSpreadModel = new LandscapeSpreadModel(spreadCount * 2, initialSpread * 2);
             portraitModel = null;
             clearPortraitResources();
         } else {

@@ -93,7 +93,7 @@ public final class PlayLikeCurlModel {
                 gestureStartCurlPosition = activePageState().getCurlPosition();
             }
             float value = gestureStartCurlPosition + movedFraction * GRID;
-            if (value <= GRID) activePageState().setCurlPosition(value);
+            if (value <= GRID && canSwipePrevious()) activePageState().setCurlPosition(value);
         } else if (delta < 0f) {
             float value = (1f - Math.abs(movedFraction)) * GRID
                     - (GRID - gestureStartCurlPosition);
